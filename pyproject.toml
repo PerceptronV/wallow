@@ -6,7 +6,26 @@ build-backend = "setuptools.build_meta"
 name = "wallow"
 version = "0.1.0"
 description = "A deduplicating run registry for ML research, with TOML schemas, an expression DSL, and Alembic migrations."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Yiding Song", email = "dev@yiding.rocks" }]
 requires-python = ">=3.10"
+keywords = ["ml", "experiments", "registry", "deduplication", "sqlalchemy", "alembic", "research"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "sqlalchemy>=2.0",
     "alembic>=1.13",
@@ -19,6 +38,11 @@ test = [
     "pytest-cov>=4",
 ]
 
+[project.urls]
+Homepage = "https://github.com/PerceptronV/wallow"
+Repository = "https://github.com/PerceptronV/wallow"
+Issues = "https://github.com/PerceptronV/wallow/issues"
+
 [project.scripts]
 wallow = "wallow.cli:main"
 
@@ -26,7 +50,11 @@ wallow = "wallow.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-wallow = ["templates/*", "templates/**/*"]
+wallow = [
+    "templates/*.template",
+    "templates/alembic/*.template",
+    "templates/alembic/*.mako",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
