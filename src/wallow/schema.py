@@ -61,6 +61,16 @@ _VALID_FIELD_KEYS: frozenset[str] = frozenset(
     {"type", "doc", "indexed", "default", "nullable"}
 )
 
+_VALID_PROJECT_KEYS: frozenset[str] = frozenset(
+    {"name", "description", "float_precision"}
+)
+
+# Default precision for normalising identifying float values. 12 sig figs is
+# comfortably below double-precision's ~15.95 sig fig ceiling, so values that
+# differ only in the bottom few bits of mantissa noise (e.g. 0.1+0.2 vs 0.3)
+# round to the same float. Configurable via [project] float_precision.
+_DEFAULT_FLOAT_PRECISION = 12
+
 
 # --- public dataclasses ------------------------------------------------------
 
@@ -104,12 +114,23 @@ def _parse(data: Mapping[str, Any]) -> "Schema":
     project = data.get("project")
     if not isinstance(project, Mapping):
         raise SchemaParseError("missing required [project] table")
+    extra_project = set(project) - _VALID_PROJECT_KEYS
+    if extra_project:
+        raise SchemaParseError(
+            f"[project]: unknown keys {sorted(extra_project)} "
+            f"(valid keys: {sorted(_VALID_PROJECT_KEYS)})"
+        )
     name = project.get("name")
     if not isinstance(name, str) or not name:
         raise SchemaParseError("[project].name must be a non-empty string")
     description = project.get("description")
     if description is not None and not isinstance(description, str):
         raise SchemaParseError("[project].description must be a string if present")
+    float_precision = project.get("float_precision", _DEFAULT_FLOAT_PRECISION)
+    if type(float_precision) is not int or float_precision < 1:
+        raise SchemaParseError(
+            f"[project].float_precision must be a positive int, got {float_precision!r}"
+        )
 
     raw_id = data.get("identifying", {})
     raw_an = data.get("annotating", {})
@@ -141,6 +162,7 @@ def _parse(data: Mapping[str, Any]) -> "Schema":
         fields=fields,
         identifying=identifying,
         annotating=annotating,
+        float_precision=int(float_precision),
     )
 
 
@@ -235,6 +257,20 @@ def _utcnow() -> _dt.datetime:
     return _dt.datetime.now(_dt.timezone.utc)
 
 
+def _normalise_float(value: float, precision: int) -> float:
+    """Round a float to `precision` significant figures.
+
+    Used to make IEEE-754 mantissa noise (e.g. ``0.1 + 0.2`` vs ``0.3``)
+    dedupe consistently for identifying float fields. NaN, infinity, and
+    zero pass through untouched — they have stable identity already, and
+    log10(0) would blow up.
+    """
+    if not math.isfinite(value) or value == 0.0:
+        return value
+    magnitude = -int(math.floor(math.log10(abs(value)))) + (precision - 1)
+    return round(value, magnitude)
+
+
 class Schema:
     """Parsed wallow schema with the dynamically generated `Run` model."""
 
@@ -243,6 +279,7 @@ class Schema:
     fields: dict[str, FieldDecl]
     identifying: frozenset[str]
     annotating: frozenset[str]
+    float_precision: int
     Base: type
     Run: type
 
@@ -254,15 +291,28 @@ class Schema:
         fields: dict[str, FieldDecl],
         identifying: frozenset[str],
         annotating: frozenset[str],
+        float_precision: int = _DEFAULT_FLOAT_PRECISION,
     ) -> None:
         self.project_name = project_name
         self.description = description
         self.fields = fields
         self.identifying = identifying
         self.annotating = annotating
+        self.float_precision = float_precision
         self.Base, self.Run = _build_model(self)
 
     # iteration / lookup --------------------------------------------------
+
+    @property
+    def f(self) -> "_FieldNamespace":
+        """Eager-validating field accessor: ``schema.f.lr`` returns a Field.
+
+        Unknown names raise ``AttributeError`` immediately (before the AST
+        is built or any query is materialised), so typos surface at the
+        callsite rather than at compile time. ``dir(schema.f)`` lists the
+        valid names for IDE autocomplete.
+        """
+        return _FieldNamespace(self)
 
     def field(self, name: str) -> FieldDecl:
         try:
@@ -278,6 +328,40 @@ class Schema:
         return iter(self.fields.values())
 
     # validation used by Store.register ----------------------------------
+
+    def fill_identifying_defaults(
+        self, identifying: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Return a new dict with declared defaults filled in for missing keys.
+
+        Identifying fields with a TOML ``default`` may be omitted from the
+        ``identifying`` argument to ``register``/``find``; this helper fills
+        them in before validation. Fields without a default stay missing
+        and ``validate_identifying_keys`` will raise.
+        """
+        out = dict(identifying)
+        for name in self.identifying:
+            if name not in out:
+                decl = self.fields[name]
+                if decl.default is not None:
+                    out[name] = decl.default
+        return out
+
+    def normalise_identifying_value(self, name: str, value: Any) -> Any:
+        """Normalise an identifying-field value to its canonical form.
+
+        Currently only float identifying fields are normalised: rounded to
+        ``self.float_precision`` significant figures so IEEE-754 mantissa
+        noise doesn't split dedup groups. Other types pass through.
+        """
+        if value is None:
+            return value
+        decl = self.fields.get(name)
+        if decl is None or not decl.is_identifying:
+            return value
+        if decl.type == "float" and isinstance(value, float):
+            return _normalise_float(value, self.float_precision)
+        return value
 
     def validate_identifying_keys(self, keys: Mapping[str, Any]) -> None:
         provided = frozenset(keys)
@@ -460,3 +544,31 @@ def _build_model(schema: Schema) -> tuple[type, type]:
 
     Run = type("Run", (Base,), attrs)
     return Base, Run
+
+
+class _FieldNamespace:
+    """Attribute-access wrapper over Schema.fields that returns DSL Fields.
+
+    Backs ``Schema.f``. Imports ``Field`` lazily from ``wallow.dsl`` to
+    avoid a circular import at module-load time.
+    """
+
+    __slots__ = ("_schema",)
+
+    def __init__(self, schema: Schema) -> None:
+        self._schema = schema
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        if name not in self._schema.fields:
+            raise AttributeError(
+                f"{name!r} is not a field on this schema; "
+                f"valid: {sorted(self._schema.fields)}"
+            )
+        from .dsl import Field  # local import: dsl imports schema for typing
+
+        return Field(name, _schema=self._schema)
+
+    def __dir__(self) -> list[str]:
+        return sorted(self._schema.fields)

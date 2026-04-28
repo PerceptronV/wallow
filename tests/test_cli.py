@@ -138,7 +138,7 @@ def test_cli_inspect_existing_run(project_dir: Path, capsys):
         },
         annotating={"status": "running"},
         on_duplicate="raise",
-    )
+    ).run
     run_id = run.id
     store.engine.dispose()
 

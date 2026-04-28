@@ -101,6 +101,7 @@ The schema file is `wallow.toml` at the project root by default (location config
 [project]
 name = "matching_feedback"
 description = "Meta-learning feedback plasticity rules across structural classes."
+float_precision = 12   # optional; sig-figs used to normalise identifying-float values (default 12)
 
 [identifying.cell_k]
 type = "int"
@@ -193,7 +194,7 @@ The implementer must reject any user-declared field with name `id`, `created_at`
 The TOML loader must:
 
 1. Parse the file using `tomllib` (Python 3.11+) or `tomli` (3.10).
-2. Require exactly one `[project]` table with at least `name` (string).
+2. Require exactly one `[project]` table with at least `name` (string). Accept optional `description` (string) and `float_precision` (positive int, default 12). Reject any other key inside `[project]`.
 3. Require at least one identifying field. Schemas with zero identifying fields raise `SchemaParseError`.
 4. Validate every field's `type` is in the catalogue.
 5. Reject identifying fields with disallowed types.
@@ -294,34 +295,62 @@ class Store:
 ### 4.3 register()
 
 ```python
+@dataclass(frozen=True)
+class RegisterResult:
+    run: Run | None        # the row (None only for "skip" on duplicate)
+    was_inserted: bool     # True iff this call inserted a new row
+    was_updated: bool      # True iff this call wrote annotating fields to an existing row
+    was_skipped: bool      # True iff an existing row was returned without modification
+
 def register(
     store: Store,
     *,
     identifying: dict[str, Any],
     annotating: dict[str, Any] | None = None,
-    on_duplicate: Literal["raise", "return_existing", "overwrite", "skip"],
-) -> Run | None:
+    on_duplicate: Literal[
+        "raise", "return_existing", "overwrite", "skip", "claim_if_stale"
+    ],
+    stale_after: datetime.timedelta | None = None,
+) -> RegisterResult:
     """Register a run.
 
     Args:
         store: a Store.
-        identifying: keys must EXACTLY match store.schema.identifying.
+        identifying: keys must match store.schema.identifying, except that any
+            field with a TOML `default` may be omitted (the default is filled
+            in before validation and dedup).
         annotating: subset of store.schema.annotating; missing fields are NULL.
         on_duplicate: required (no default).
+        stale_after: required when on_duplicate='claim_if_stale'; ignored otherwise.
 
     Returns:
-        - 'raise':           Run on success; raises DuplicateRunError on duplicate.
-        - 'return_existing': new Run on success, or existing Run on duplicate.
-        - 'overwrite':       new Run on success, or updated existing Run on duplicate.
-        - 'skip':            new Run on success, or None on duplicate.
+        RegisterResult. Exactly one of was_inserted / was_updated / was_skipped is
+        True for every outcome except `return_existing` on a duplicate, where all
+        three are False.
+
+        - 'raise':           was_inserted=True; raises DuplicateRunError on duplicate.
+        - 'return_existing': was_inserted=True (new) or all-False (existing returned).
+        - 'overwrite':       was_inserted=True (new) or was_updated=True (existing modified).
+        - 'skip':            was_inserted=True (new) or run=None + was_skipped=True (duplicate).
+        - 'claim_if_stale':  was_inserted=True (new); was_updated=True (existing was stale
+                             — annotating fields written and updated_at bumped); was_skipped=
+                             True (existing was fresh — returned untouched).
+
+    Identifying float values are normalised to schema.float_precision sig figs
+    before insertion / lookup so IEEE-754 mantissa noise (0.1+0.2 vs 0.3) doesn't
+    split dedup groups.
 
     Raises:
-        SchemaValidationError: identifying keys mismatch schema, or types wrong.
+        SchemaValidationError: required identifying keys missing (no default), or
+            unknown / wrong-typed values supplied.
+        ValueError: on_duplicate='claim_if_stale' without a timedelta `stale_after`.
         DuplicateRunError: only when on_duplicate='raise'.
     """
 ```
 
 The `on_duplicate` parameter is required (no default). This forces every caller to think about the semantics.
+
+**`claim_if_stale` algorithm.** On a UNIQUE collision, read the existing row's `updated_at` (auto-populated on insert and bumped on every UPDATE). If `now() - updated_at > stale_after`, treat as `overwrite` (write the annotating fields and bump `updated_at` unconditionally so the heartbeat clock restarts) and return `was_updated=True`. Otherwise return the existing row untouched with `was_skipped=True`. SQLAlchemy's default DateTime column on SQLite drops tzinfo on read; the implementation must coerce a naive `updated_at` back to UTC before subtracting from a tz-aware `now()`.
 
 ### 4.4 find()
 
@@ -331,13 +360,34 @@ def find(store: Store, **identifying: Any) -> Run | None:
 
     Args:
         store: a Store.
-        **identifying: keys must EXACTLY match store.schema.identifying.
+        **identifying: keys must match store.schema.identifying, except that any
+            field with a TOML `default` may be omitted. Float values are normalised
+            to schema.float_precision sig figs (same as register).
 
     Returns:
         The Run with matching identifying fields, or None.
 
     Raises:
-        SchemaValidationError: identifying keys mismatch schema.
+        SchemaValidationError: required identifying keys missing (no default), or
+            unknown / wrong-typed values supplied.
+    """
+```
+
+### 4.4b heartbeat()
+
+```python
+def heartbeat(store: Store, *, identifying: dict[str, Any]) -> datetime.datetime:
+    """Bump `updated_at` for the run with this identifying tuple.
+
+    Pairs with on_duplicate='claim_if_stale' for live multi-worker dispatch:
+    a worker calls heartbeat periodically while training so other workers see
+    the row as fresh and don't claim it. Returns the new updated_at (tz-aware UTC).
+
+    Identifying defaults are filled and floats normalised the same way as
+    register / find.
+
+    Raises:
+        SchemaValidationError: no row matches the identifying tuple.
     """
 ```
 
@@ -346,8 +396,16 @@ def find(store: Store, **identifying: Any) -> Run | None:
 The DSL is the recommended way to build queries from downstream code, especially when field names come from configuration rather than as Python identifiers.
 
 ```python
-def F(name: str) -> Field:
-    """Create a field reference. Resolved against the schema at compile time."""
+def F(name: str, schema: Schema | None = None) -> Field:
+    """Create a field reference.
+
+    By default, name resolution is deferred until compile time so the same
+    expression can be reused across schemas. Pass `schema=...` to validate
+    the name eagerly; an unknown name raises SchemaValidationError at the
+    F() callsite. The schema-bound shortcut `schema.f.<name>` performs the
+    same eager check via attribute access (raises AttributeError on typo)
+    and supports `dir(schema.f)` for IDE autocomplete.
+    """
 
 class Field:
     """A named field reference. Supports comparison and JSON path operators."""
@@ -414,9 +472,9 @@ class Query:
 
 **Operator precedence.** Python's `&`/`|` have lower precedence than comparison operators only when the comparisons are inside parentheses. Users must write `(F("k") == 4) & (F("v") > 0.85)`. This is the standard pandas/SQLAlchemy convention; document it.
 
-**Field resolution.** `F("name")` does not validate the name immediately. Resolution happens when an `Expr` is compiled against a model class (during query execution). If `name` is not a field, `compile()` raises `SchemaValidationError` with a helpful message listing valid field names.
+**Field resolution.** `F("name")` (no schema) does not validate the name immediately. Resolution happens when an `Expr` is compiled against a model class (during query execution). If `name` is not a field, `compile()` raises `SchemaValidationError` with a helpful message listing valid field names. `F("name", schema=...)` and `schema.f.name` both validate eagerly at the callsite — preferred for code that already has a Schema in hand.
 
-**Type coercion.** When the right-hand side of a comparison can't be coerced to the field's type, raise `SchemaValidationError` at compile time. Special cases: comparing a `bool` field to `0` or `1` is allowed (coerce); comparing a `string` field to `None` is allowed and treated as `IS NULL` / `IS NOT NULL`.
+**Type coercion.** When the right-hand side of a comparison can't be coerced to the field's type, raise `SchemaValidationError` at compile time. Special cases: comparing a `bool` field to `0` or `1` is allowed (coerce); comparing a `string` field to `None` is allowed and treated as `IS NULL` / `IS NOT NULL`. Comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`, `in_`, `not_in`) against an *identifying* float field have their RHS normalised to `schema.float_precision` sig figs (same rule as `register` / `find`), so `F("lr") == 0.1 + 0.2` matches a row stored at `lr = 0.3`. JSON-path comparisons are left untouched (the underlying type is opaque). Range queries against annotating floats are not normalised; they preserve full precision.
 
 **JSON paths.** `F("discovered_T").json_path("T_1100") > 0.05` compiles to `func.json_extract(Run.discovered_T, '$.T_1100') > 0.05`. Nested paths use dot notation: `F("x").json_path("a.b.c")` → `'$.a.b.c'`. JSON paths are only valid on `json`-typed fields; checked at compile.
 
@@ -553,6 +611,7 @@ Responsibilities:
 - Parse TOML files into `Schema` objects.
 - Validate field declarations against the type catalogue and reserved-name list.
 - Generate the SQLAlchemy declarative `Base` and `Run` classes dynamically.
+- Provide `Schema.fill_identifying_defaults`, `Schema.normalise_identifying_value`, and the `Schema.f` attribute-access namespace used by the DSL for eager validation.
 
 #### Dynamic model generation
 
@@ -623,14 +682,23 @@ When `register()` is called, the implementer must validate values:
 
 NaN in identifying float fields must be rejected (raises `SchemaValidationError`). NaN's identity semantics break dedup.
 
+#### Default-fill, float normalisation, and the field namespace
+
+Three helpers on `Schema` support the v0.2 ergonomics:
+
+- `fill_identifying_defaults(d)` returns a new dict with declared TOML defaults filled in for any missing identifying key. Called by `register`, `find`, and `heartbeat` before `validate_identifying_keys`. Fields without a `default` stay missing and the validator still raises.
+- `_normalise_float(value, precision)` (module-level helper) rounds a float to `precision` significant figures via `round(value, -floor(log10(|value|)) + precision - 1)`. Zero, NaN, and infinity pass through unchanged (`math.isfinite` gate). `Schema.normalise_identifying_value(name, v)` calls this for identifying-float fields and returns `v` unchanged for everything else.
+- `Schema.f` returns a `_FieldNamespace` that resolves attribute access to a DSL `Field` (lazily importing `wallow.dsl.Field` to avoid a module-load cycle). Unknown names raise `AttributeError` at the callsite. `dir(schema.f)` returns the sorted list of declared field names so IDE autocomplete works.
+
 ### 6.2 `store.py`
 
 Responsibilities:
 
 - Wrap engine creation, session management, and pragma settings (WAL, foreign keys).
-- Implement `register()` and `find()`.
+- Implement `register()`, `find()`, and `heartbeat()`.
 - Provide the `where()` entry point that returns a `Query`.
 - Implement `check_schema()` by comparing the database's `alembic_version` row to the head revision in `alembic/versions/`.
+- Define the `RegisterResult` dataclass returned by `register`.
 
 #### Coexistence with Alembic
 
@@ -650,42 +718,66 @@ Responsibilities:
 
 #### `register()` implementation sketch
 
+The shared identifying-prep step (default-fill → validate-keys → validate-types → normalise floats) is factored into `_prepare_identifying(schema, identifying)` and reused by `register`, `find`, and `heartbeat`.
+
 ```python
-def register(store, *, identifying, annotating=None, on_duplicate):
+def _prepare_identifying(schema, identifying):
+    out = schema.fill_identifying_defaults(identifying)
+    schema.validate_identifying_keys(out)
+    for k, v in out.items():
+        schema.validate_value(schema.field(k), v, allow_none=False)
+    return {k: schema.normalise_identifying_value(k, v) for k, v in out.items()}
+
+def register(store, *, identifying, annotating=None,
+             on_duplicate, stale_after=None):
+    if on_duplicate == "claim_if_stale" and not isinstance(stale_after, timedelta):
+        raise ValueError("on_duplicate='claim_if_stale' requires `stale_after`")
+
     schema = store.schema
-    schema.validate_identifying_keys(identifying)
-    schema.validate_types(identifying, annotating or {})
+    annotating = dict(annotating or {})
+    schema.validate_annotating_keys(annotating)
+    for k, v in annotating.items():
+        schema.validate_value(schema.field(k), v, allow_none=True)
+    identifying = _prepare_identifying(schema, identifying)
 
     Run = schema.Run
-    new_run = Run(**identifying, **(annotating or {}))
-
-    with store.session() as session:
-        session.add(new_run)
+    with store.session() as s:
+        new_run = Run(**identifying, **annotating)
+        s.add(new_run)
         try:
-            session.flush()
-            session.refresh(new_run)
-            return new_run
+            s.flush()
+            return RegisterResult(run=new_run, was_inserted=True)
         except IntegrityError:
-            session.rollback()
-            existing = session.scalar(select(Run).filter_by(**identifying))
-            assert existing is not None
+            s.rollback()
+            existing = s.scalar(select(Run).filter_by(**identifying))
 
             if on_duplicate == "raise":
+                s.expunge(existing)
                 raise DuplicateRunError(existing)
-            elif on_duplicate == "return_existing":
-                return existing
-            elif on_duplicate == "skip":
-                return None
-            elif on_duplicate == "overwrite":
-                for k, v in (annotating or {}).items():
+            if on_duplicate == "return_existing":
+                return RegisterResult(run=existing, was_inserted=False)
+            if on_duplicate == "skip":
+                return RegisterResult(run=None, was_inserted=False, was_skipped=True)
+            if on_duplicate == "overwrite":
+                for k, v in annotating.items():
                     setattr(existing, k, v)
-                session.flush()
-                return existing
-            else:
-                raise ValueError(f"unknown on_duplicate: {on_duplicate!r}")
+                s.flush()
+                return RegisterResult(run=existing, was_inserted=False, was_updated=True)
+            if on_duplicate == "claim_if_stale":
+                now = _utcnow()
+                last = _make_naive_aware(existing.updated_at)  # SQLite drops tz
+                if last is None or (now - last) > stale_after:
+                    for k, v in annotating.items():
+                        setattr(existing, k, v)
+                    existing.updated_at = now    # bump unconditionally
+                    s.flush()
+                    return RegisterResult(run=existing, was_inserted=False, was_updated=True)
+                return RegisterResult(run=existing, was_inserted=False, was_skipped=True)
 ```
 
-The implementer must ensure the rolled-back `new_run` doesn't pollute the session.
+The implementer must ensure the rolled-back `new_run` doesn't pollute the session. `_make_naive_aware` reattaches `tzinfo=UTC` to a naive `updated_at` read back from SQLite (SQLAlchemy's default DateTime column is timezone-naive; tz-aware values written by `_utcnow` come back without tzinfo).
+
+`heartbeat(store, identifying)` is the symmetric primitive: prepare the identifying tuple (defaults filled, floats normalised), look up the row, set `updated_at = _utcnow()`, raise `SchemaValidationError` if the row doesn't exist. It exists so a long-running worker can signal liveness without spuriously rewriting annotating fields.
 
 ### 6.3 `dsl.py`
 
@@ -749,6 +841,9 @@ When compiling, the implementer must:
 - Validate that each `FieldRef.name` exists in the schema. Raise `SchemaValidationError` with a list of valid names if not.
 - Validate that string operators are only used on string-typed fields, JSON paths only on JSON-typed fields, etc.
 - Coerce comparison values to the field's type where reasonable.
+- After coercion, normalise the RHS of comparisons against an *identifying* float field (skipping JSON-path comparisons) using `schema.normalise_identifying_value`, mirroring the rule applied in `register` / `find`. This applies to both `_Compare` and `_In` nodes.
+
+`F(name, schema=...)` performs the eager-validation check before constructing the AST node — it queries `schema.fields` membership and raises `SchemaValidationError` immediately. The schema reference is stored on the resulting `Field` and propagated through `Field.json_path()` so chained ops keep the eager binding.
 
 ### 6.4 `migrations.py`
 
@@ -975,7 +1070,9 @@ Every migration runs in a single transaction (Alembic's default). Migration file
 
 The implementer must handle these explicitly. Tests for each are required.
 
-**Float identity.** Two runs with identifying field `x=0.1+0.2` and `x=0.3` hash differently (and dedupe differently) due to IEEE 754. Document this; don't try to normalise.
+**Float normalisation.** Identifying float values are rounded to `schema.float_precision` significant figures (default 12) at register / find / DSL-compile time so IEEE-754 mantissa noise (e.g. `0.1 + 0.2` vs `0.3`) collapses to the same canonical float. NaN remains rejected; ±inf and 0.0 pass through normalisation unchanged. Annotating floats are not normalised — they preserve full precision. Set `[project] float_precision = N` to tune (large N → bit-exact identity; small N → looser dedup).
+
+**`claim_if_stale` semantics.** On a UNIQUE collision, compare `existing.updated_at` (made tz-aware UTC if SQLite stripped tz) to `_utcnow()`. If `now - updated_at > stale_after`, overwrite the annotating fields and bump `updated_at`; return `RegisterResult(was_updated=True)`. Otherwise return the existing row untouched with `was_skipped=True`. Calling without `stale_after` is a `ValueError`. The companion `heartbeat()` function bumps `updated_at` without other side effects so a live worker can signal liveness during long silent training intervals.
 
 **NaN in identifying floats.** Reject at register time with `SchemaValidationError`.
 
@@ -1136,6 +1233,16 @@ This section was added after Phases 3–4 landed. It records the resolved decisi
 
 - **Concurrent-register tests need a WAL bootstrap.** When the parent test process didn't open a `Store` first (e.g., the post-migration version of the concurrent test), the SQLite DB is still in rollback-journal mode and two writer subprocesses can deadlock. The fix in `tests/test_migrations.py` is to construct a parent `Store` once before forking workers; `Store._install_pragmas` sets `journal_mode=WAL` on its first connection.
 - **Phase 5 (README, packaging, examples)** is still pending. The implementation is feature-complete and the test suite is green, but docstrings and an `examples/matching_feedback/` directory haven't been written.
+
+### v0.2 ergonomics pass
+
+Five API changes applied after the initial intuitiveness review. All are surfaced in §3, §4, §6, and §9; this section is the index.
+
+1. **Identifying defaults are honoured at register / find time** (§4.3, §4.4, §6.1). `register(..., identifying={"lr": 1e-3})` now succeeds when the schema declares `default = 0` for `seed`. `Schema.fill_identifying_defaults` is the new helper; missing fields without a default still raise. Removes the long-standing surprise that the word "default" did everything except what users expected.
+2. **`register` returns `RegisterResult`** (§4.3, §6.2). The dataclass carries `run`, `was_inserted`, `was_updated`, `was_skipped`. Breaking change: callers that did `run = register(...)` must now do `run = register(...).run`. Lets workers distinguish "I claimed this combo" from "I rejoined someone else's row" without a separate query.
+3. **Eager DSL field validation** (§4.5, §6.1, §6.3). Two new opt-in forms: `F(name, schema=...)` raises `SchemaValidationError` at the callsite on a typo, and `schema.f.<name>` does the same via attribute access (with `dir(schema.f)` for IDE autocomplete). `F(name)` keeps the deferred-resolution semantics for cross-schema reuse.
+4. **`claim_if_stale` policy + `heartbeat()`** (§4.3, §4.4b, §9). New `on_duplicate="claim_if_stale"` with required `stale_after: timedelta` enables live multi-worker dispatch by reading the existing row's `updated_at` and either claiming a stale row (was_updated) or skipping a fresh one (was_skipped). `wallow.heartbeat(store, identifying=...)` bumps `updated_at` without other side effects so a long training run can signal liveness. No new column needed.
+5. **Identifying floats normalised by default** (§3, §4.3, §4.5, §9). Round to `[project] float_precision` significant figures (default 12) at register / find / DSL-compile time so `0.1 + 0.2` dedupes with `0.3`. Annotating floats are untouched. NaN stays rejected; ±inf and 0.0 pass through. Configurable per-schema; bit-exact behaviour requires `float_precision >= 17`.
 
 ---
 

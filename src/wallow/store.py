@@ -1,8 +1,10 @@
-"""Store: connection / session management, plus `register` and `find`."""
+"""Store: connection / session management, plus `register`, `find`, `heartbeat`."""
 
 from __future__ import annotations
 
+import datetime as _dt
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Literal, TYPE_CHECKING
 
@@ -12,16 +14,43 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from .errors import DuplicateRunError, PendingMigrationError, SchemaValidationError, WallowError
-from .schema import Schema
+from .schema import Schema, _utcnow
 
 if TYPE_CHECKING:
     from .dsl import Expr, Query
 
 
-_OnDuplicate = Literal["raise", "return_existing", "overwrite", "skip"]
+_OnDuplicate = Literal[
+    "raise", "return_existing", "overwrite", "skip", "claim_if_stale"
+]
 _VALID_ON_DUPLICATE: frozenset[str] = frozenset(
-    {"raise", "return_existing", "overwrite", "skip"}
+    {"raise", "return_existing", "overwrite", "skip", "claim_if_stale"}
 )
+
+
+@dataclass(frozen=True)
+class RegisterResult:
+    """Outcome of a ``register`` call.
+
+    ``run`` is the resulting Run (or ``None`` for ``on_duplicate='skip'``
+    on a duplicate). The boolean flags describe what happened:
+
+    - ``was_inserted=True`` — a new row was created by this call.
+    - ``was_updated=True`` — an existing row's annotating fields were
+      written by this call (``overwrite``, or ``claim_if_stale`` claiming
+      a stale row).
+    - ``was_skipped=True`` — an existing row was returned unchanged
+      (``skip`` on duplicate, or ``claim_if_stale`` finding a fresh row).
+
+    Exactly one flag is set per call. ``return_existing`` on a duplicate
+    leaves all three False — the row was neither inserted, updated, nor
+    skipped in any meaningful sense; the caller asked for it.
+    """
+
+    run: Any | None
+    was_inserted: bool
+    was_updated: bool = False
+    was_skipped: bool = False
 
 
 def _build_url(db_path: str | Path) -> str:
@@ -215,7 +244,37 @@ class Store:
         migrations.apply(cfg)
 
 
-# --- module-level register / find -------------------------------------------
+# --- module-level register / find / heartbeat ------------------------------
+
+
+def _prepare_identifying(schema: Schema, identifying: dict[str, Any]) -> dict[str, Any]:
+    """Fill defaults, validate, and normalise an identifying dict.
+
+    Centralises the three-step preparation shared by register, find, and
+    heartbeat: (1) fill missing keys from declared TOML defaults, (2) check
+    the key set and per-field types, (3) normalise float identifying fields
+    so IEEE-754 mantissa noise doesn't split dedup groups.
+    """
+    out = schema.fill_identifying_defaults(identifying)
+    schema.validate_identifying_keys(out)
+    for k, v in out.items():
+        schema.validate_value(schema.field(k), v, allow_none=False)
+    return {k: schema.normalise_identifying_value(k, v) for k, v in out.items()}
+
+
+def _make_naive_aware(t: _dt.datetime | None) -> _dt.datetime | None:
+    """Coerce a datetime read back from SQLite to tz-aware UTC.
+
+    SQLAlchemy's default ``DateTime`` column on SQLite doesn't preserve
+    tzinfo, so values written by ``_utcnow`` (tz-aware UTC) come back
+    naive. We attach UTC back so arithmetic against a tz-aware ``now()``
+    works without a TypeError.
+    """
+    if t is None:
+        return None
+    if t.tzinfo is None:
+        return t.replace(tzinfo=_dt.timezone.utc)
+    return t
 
 
 def register(
@@ -224,23 +283,39 @@ def register(
     identifying: dict[str, Any],
     annotating: dict[str, Any] | None = None,
     on_duplicate: _OnDuplicate,
-) -> Any:
-    """Register a run; returns a Run (or None on 'skip' duplicate)."""
+    stale_after: _dt.timedelta | None = None,
+) -> RegisterResult:
+    """Register a run; returns a :class:`RegisterResult`.
+
+    Identifying keys may omit any field that declares a TOML ``default``;
+    the default is filled in automatically. Identifying float values are
+    rounded to ``schema.float_precision`` significant figures so IEEE-754
+    noise doesn't split dedup.
+
+    ``on_duplicate='claim_if_stale'`` requires ``stale_after``: on a
+    collision, if the existing row's ``updated_at`` is older than that
+    delta, the row is overwritten with the provided annotating fields and
+    the result has ``was_updated=True``. Otherwise the existing row is
+    returned untouched and ``was_skipped=True``.
+    """
     if on_duplicate not in _VALID_ON_DUPLICATE:
         raise ValueError(
             f"on_duplicate must be one of {sorted(_VALID_ON_DUPLICATE)}, "
             f"got {on_duplicate!r}"
         )
+    if on_duplicate == "claim_if_stale":
+        if not isinstance(stale_after, _dt.timedelta):
+            raise ValueError(
+                "on_duplicate='claim_if_stale' requires a datetime.timedelta "
+                "`stale_after` (e.g. timedelta(minutes=5))"
+            )
 
     schema = store.schema
     annotating = dict(annotating or {})
-    schema.validate_identifying_keys(identifying)
     schema.validate_annotating_keys(annotating)
-
-    for k, v in identifying.items():
-        schema.validate_value(schema.field(k), v, allow_none=False)
     for k, v in annotating.items():
         schema.validate_value(schema.field(k), v, allow_none=True)
+    identifying = _prepare_identifying(schema, identifying)
 
     Run = schema.Run
 
@@ -259,26 +334,73 @@ def register(
                 s.expunge(existing)
                 raise DuplicateRunError(existing)
             if on_duplicate == "return_existing":
-                return existing
+                return RegisterResult(run=existing, was_inserted=False)
             if on_duplicate == "skip":
-                return None
+                return RegisterResult(run=None, was_inserted=False, was_skipped=True)
             if on_duplicate == "overwrite":
                 for k, v in annotating.items():
                     setattr(existing, k, v)
                 s.flush()
-                return existing
+                return RegisterResult(
+                    run=existing, was_inserted=False, was_updated=True
+                )
+            if on_duplicate == "claim_if_stale":
+                now = _utcnow()
+                last = _make_naive_aware(existing.updated_at)
+                is_stale = last is None or (now - last) > stale_after  # type: ignore[operator]
+                if is_stale:
+                    for k, v in annotating.items():
+                        setattr(existing, k, v)
+                    # Bump updated_at unconditionally — onupdate only fires
+                    # on a dirty UPDATE, and a claim with no annotating
+                    # fields shouldn't silently leave the heartbeat stale.
+                    existing.updated_at = now
+                    s.flush()
+                    return RegisterResult(
+                        run=existing, was_inserted=False, was_updated=True
+                    )
+                return RegisterResult(
+                    run=existing, was_inserted=False, was_skipped=True
+                )
             # Unreachable: validated at the top of the function.
             raise AssertionError(f"unhandled on_duplicate={on_duplicate!r}")
-        return new_run
+        return RegisterResult(run=new_run, was_inserted=True)
 
 
 def find(store: Store, **identifying: Any) -> Any:
-    """Direct identifying-fields lookup. Returns the Run or None."""
-    schema = store.schema
-    schema.validate_identifying_keys(identifying)
-    for k, v in identifying.items():
-        schema.validate_value(schema.field(k), v, allow_none=False)
+    """Direct identifying-fields lookup. Returns the Run or None.
 
+    Identifying keys may omit any field with a declared TOML ``default``;
+    float identifying values are normalised the same way as ``register``
+    so a lookup matches the row that was registered.
+    """
+    schema = store.schema
+    identifying = _prepare_identifying(schema, identifying)
     Run = schema.Run
     with store.session() as s:
         return s.scalar(select(Run).filter_by(**identifying))
+
+
+def heartbeat(store: Store, *, identifying: dict[str, Any]) -> _dt.datetime:
+    """Bump ``updated_at`` for the run with this identifying tuple.
+
+    Pairs with ``on_duplicate='claim_if_stale'`` for live multi-worker
+    dispatch: a worker calls ``heartbeat`` periodically while training so
+    other workers see the row as fresh and don't claim it. Returns the
+    new ``updated_at`` (tz-aware UTC).
+
+    Raises :class:`SchemaValidationError` when no row matches.
+    """
+    schema = store.schema
+    identifying = _prepare_identifying(schema, identifying)
+    Run = schema.Run
+    now = _utcnow()
+    with store.session() as s:
+        existing = s.scalar(select(Run).filter_by(**identifying))
+        if existing is None:
+            raise SchemaValidationError(
+                f"no run with identifying={identifying} to heartbeat",
+            )
+        existing.updated_at = now
+        s.flush()
+    return now

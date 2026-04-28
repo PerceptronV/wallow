@@ -25,12 +25,16 @@ from conftest import make_identifying
 
 
 def test_register_inserts_new_run(memory_store: Store):
-    run = register(
+    result = register(
         memory_store,
         identifying=make_identifying(),
         annotating={"status": "running", "val_accuracy": 0.8},
         on_duplicate="raise",
     )
+    assert result.was_inserted is True
+    assert result.was_updated is False
+    assert result.was_skipped is False
+    run = result.run
     assert run.id is not None
     assert run.cell_k == 4
     assert run.status == "running"
@@ -41,7 +45,7 @@ def test_register_omitted_annotating_defaults_to_null(memory_store: Store):
         memory_store,
         identifying=make_identifying(),
         on_duplicate="raise",
-    )
+    ).run
     assert run.status is None
     assert run.val_accuracy is None
 
@@ -77,13 +81,17 @@ def test_on_duplicate_return_existing(memory_store: Store):
         identifying=make_identifying(),
         annotating={"status": "running"},
         on_duplicate="raise",
-    )
-    second = register(
+    ).run
+    result = register(
         memory_store,
         identifying=make_identifying(),
         annotating={"status": "different"},
         on_duplicate="return_existing",
     )
+    assert result.was_inserted is False
+    assert result.was_updated is False
+    assert result.was_skipped is False
+    second = result.run
     assert second.id == first.id
     # return_existing does NOT update annotating fields
     assert second.status == "running"
@@ -92,11 +100,13 @@ def test_on_duplicate_return_existing(memory_store: Store):
 def test_on_duplicate_skip(memory_store: Store):
     first = register(
         memory_store, identifying=make_identifying(), on_duplicate="raise"
-    )
+    ).run
     result = register(
         memory_store, identifying=make_identifying(), on_duplicate="skip"
     )
-    assert result is None
+    assert result.run is None
+    assert result.was_inserted is False
+    assert result.was_skipped is True
     # Confirm the original is still there.
     assert find(memory_store, **make_identifying()).id == first.id
 
@@ -107,13 +117,16 @@ def test_on_duplicate_overwrite(memory_store: Store):
         identifying=make_identifying(),
         annotating={"status": "running", "val_accuracy": 0.5},
         on_duplicate="raise",
-    )
-    updated = register(
+    ).run
+    result = register(
         memory_store,
         identifying=make_identifying(),
         annotating={"status": "completed", "val_accuracy": 0.9},
         on_duplicate="overwrite",
     )
+    assert result.was_inserted is False
+    assert result.was_updated is True
+    updated = result.run
     assert updated.id == first.id
     assert updated.status == "completed"
     assert updated.val_accuracy == 0.9
@@ -132,11 +145,12 @@ def test_invalid_on_duplicate_raises(memory_store: Store):
 
 
 def test_register_missing_identifying_key(memory_store: Store):
+    # cell_k has no `default` in the fixture, so omitting it is a hard error.
     keys = make_identifying()
-    keys.pop("seed")
+    keys.pop("cell_k")
     with pytest.raises(SchemaValidationError) as ei:
         register(memory_store, identifying=keys, on_duplicate="raise")
-    assert "seed" in ei.value.missing_keys
+    assert "cell_k" in ei.value.missing_keys
 
 
 def test_register_extra_identifying_key(memory_store: Store):
@@ -181,7 +195,7 @@ def test_register_int_for_float_accepted(memory_store: Store):
         memory_store,
         identifying=make_identifying(cell_sigma=2),
         on_duplicate="raise",
-    )
+    ).run
     assert run.cell_sigma == 2
 
 
@@ -211,7 +225,7 @@ def test_register_aware_datetime_accepted(memory_store: Store):
         identifying=make_identifying(),
         annotating={"started_at": when},
         on_duplicate="raise",
-    )
+    ).run
     assert run.started_at is not None
 
 

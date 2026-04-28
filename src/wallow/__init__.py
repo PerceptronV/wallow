@@ -18,7 +18,7 @@ from .migrations import (
     head_revision,
 )
 from .schema import FieldDecl, Schema, load_schema
-from .store import Store, find, register
+from .store import RegisterResult, Store, find, heartbeat, register
 
 __all__ = [
     # schema
@@ -29,6 +29,8 @@ __all__ = [
     "Store",
     "register",
     "find",
+    "heartbeat",
+    "RegisterResult",
     # dsl
     "F",
     "Field",

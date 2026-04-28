@@ -81,9 +81,23 @@ _Node = Union[_Compare, _In, _StringOp, _IsNull, _And, _Or, _Not]
 # --- public Field / Expr -----------------------------------------------------
 
 
-def F(name: str) -> "Field":
-    """Create a field reference. Resolved against the schema at compile time."""
-    return Field(name)
+def F(name: str, schema: "Schema | None" = None) -> "Field":
+    """Create a field reference.
+
+    By default, the name is validated against the schema only at compile
+    time (when a Query is materialised) so the same expression can be
+    reused across schemas. Pass ``schema=...`` to validate the name
+    eagerly — typos surface at the ``F`` callsite rather than at
+    ``q.all()``. The schema-bound shortcut ``schema.f.<name>`` does the
+    same eager check via attribute access.
+    """
+    if schema is not None and name not in schema.fields:
+        raise SchemaValidationError(
+            f"unknown field {name!r}; valid: {sorted(schema.fields)}",
+            field=name,
+            valid_names=tuple(sorted(schema.fields)),
+        )
+    return Field(name, _schema=schema)
 
 
 class Field:
@@ -93,9 +107,19 @@ class Field:
     # disable hashing to avoid accidental dict/set membership.
     __hash__ = None  # type: ignore[assignment]
 
-    def __init__(self, name: str, json_path: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self,
+        name: str,
+        json_path: tuple[str, ...] = (),
+        *,
+        _schema: "Schema | None" = None,
+    ) -> None:
         self.name = name
         self._json_path = json_path
+        # Stored only so eager-validated Fields propagate their schema
+        # through ``.json_path()``; compilation always uses the schema on
+        # the model class passed to ``compile``.
+        self._schema = _schema
 
     def _ref(self) -> _FieldRef:
         return _FieldRef(self.name, self._json_path)
@@ -157,7 +181,7 @@ class Field:
         if not path:
             raise ValueError("json_path requires a non-empty path")
         parts = tuple(path.split("."))
-        return Field(self.name, self._json_path + parts)
+        return Field(self.name, self._json_path + parts, _schema=self._schema)
 
     # ordering ----------------------------------------------------------
 
@@ -309,15 +333,32 @@ def _compile(node: _Node, model_class: type) -> ColumnElement:
         # type; we accept the RHS as-is.
         decl_type = "json" if node.field.json_path else decl.type
         v = _coerce_value(decl_type, node.value, field_name=node.field.name)
+        # Normalise identifying-float comparisons so a stored value of 0.3 is
+        # matched by F("lr") == 0.1 + 0.2 (mirrors the normalisation applied
+        # at register/find time).
+        if decl_type == "float" and decl.is_identifying and not node.field.json_path:
+            v = schema.normalise_identifying_value(node.field.name, v)
         return _OP_MAP[node.op](col, v)
 
     if isinstance(node, _In):
         col = _resolve_column(node.field, model_class)
         decl = schema.field(node.field.name)
         decl_type = "json" if node.field.json_path else decl.type
+        normalise = (
+            decl_type == "float"
+            and decl.is_identifying
+            and not node.field.json_path
+        )
         coerced = tuple(
-            _coerce_value(decl_type, v, field_name=node.field.name)
-            for v in node.values
+            (
+                schema.normalise_identifying_value(node.field.name, v_c)
+                if normalise
+                else v_c
+            )
+            for v_c in (
+                _coerce_value(decl_type, v, field_name=node.field.name)
+                for v in node.values
+            )
         )
         expr = col.in_(coerced)
         return not_(expr) if node.negate else expr

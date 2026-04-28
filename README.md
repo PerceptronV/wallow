@@ -13,9 +13,9 @@ A `wallow` schema declares two kinds of fields:
 - **Identifying fields** — together they form a composite UNIQUE key. Two runs with identical values across all identifying fields are *the same run*. This is what defines an "experiment" for your project. Use these for hyperparameters, dataset version, code revision — anything that, if changed, makes the run a different experiment.
 - **Annotating fields** — everything recorded *about* a run rather than *defining* it. Status, metrics, artefact paths, host name, timestamps, training curves. Annotating fields can be edited freely; they don't affect dedup.
 
-The `register()` call writes a run keyed on the identifying tuple. If a run with that tuple already exists, behaviour is controlled by an explicit `on_duplicate` policy — there is no default, every caller must decide.
+The `register()` call writes a run keyed on the identifying tuple and returns a `RegisterResult` that tells the caller exactly what happened (`was_inserted`, `was_updated`, `was_skipped`). If a run with that tuple already exists, behaviour is controlled by an explicit `on_duplicate` policy — there is no default, every caller must decide.
 
-This split is what enables the resume-safe sweep pattern: register before training (with `return_existing` to claim or read back the existing row), inspect `status`, skip already-completed work, then `register` again with `overwrite` to record final metrics. See the [ML sweep recipe](#recipe-an-ml-sweep-with-artefact-paths) below.
+This split is what enables the resume-safe sweep pattern: register before training (with `return_existing` to claim or read back the existing row), inspect `status`, skip already-completed work, then `register` again with `overwrite` to record final metrics. See the [ML sweep recipe](#recipe-an-ml-sweep-with-artefact-paths) below. For *live* multi-worker dispatch where two workers may both encounter the same combo at once, use `on_duplicate="claim_if_stale"` plus `wallow.heartbeat()` (see [Concurrency](#concurrency)).
 
 ## Install
 
@@ -60,12 +60,13 @@ from wallow import Store, load_schema, register
 schema = load_schema("wallow.toml")
 store  = Store("runs.db", schema=schema)
 
-run = register(
+result = register(
     store,
-    identifying={"lr": 1e-3, "seed": 0},
+    identifying={"lr": 1e-3},          # `seed` may be omitted: it has default = 0
     annotating={"status": "running"},
     on_duplicate="return_existing",
 )
+run = result.run                         # the Run; result.was_inserted etc carry context
 ```
 
 Switch to Alembic when you need [schema evolution](#schema-evolution).
@@ -108,6 +109,7 @@ wallow status                              # exits 0 when DB is at head, 1 other
 [project]
 name = "my_experiment"
 description = "What this dataset is for."   # optional
+float_precision = 12                          # optional; sig figs for identifying-float normalisation (default 12)
 
 # identifying = composite UNIQUE; together these define one experiment.
 # Restricted to int / float / string / bool.
@@ -131,7 +133,7 @@ doc      = "..."
 | TOML `type` | Python value at register-time | SQLAlchemy column | Notes |
 |---|---|---|---|
 | `int`      | `int` (NOT `bool`)            | `Integer`         | Bool is a `int` subclass in Python but rejected here |
-| `float`    | `int` or `float` (NOT `bool`) | `Float`           | NaN rejected on identifying floats; IEEE 754 identity (0.1+0.2 ≠ 0.3) |
+| `float`    | `int` or `float` (NOT `bool`) | `Float`           | NaN rejected on identifying floats. Identifying floats are normalised to 12 sig figs by default — see [Identifying floats and normalisation](#identifying-floats-and-normalisation) |
 | `string`   | `str`                         | `String`          | |
 | `bool`     | `bool`                        | `Boolean`         | |
 | `json`     | any JSON-serialisable         | `JSON`            | Annotating only. Query with `F("...").json_path("a.b")` |
@@ -146,17 +148,34 @@ doc      = "..."
 
 ### Defaults and NULLs
 
-A `default` on an identifying field is rendered as both a Python-side default and a DDL `server_default`. This is what lets you *add* an identifying field in a later migration: existing rows get backfilled with the default, so the new NOT NULL column applies cleanly to a non-empty table.
+A `default` on an identifying field does three things:
+
+1. **Register-time fill.** `register()` and `find()` may omit any identifying field with a declared default; the default is filled in before validation and dedup. So `register(..., identifying={"lr": 1e-3})` is fine when `seed` declares `default = 0`.
+2. **Migration backfill.** When you add an identifying field in a later migration, the default becomes a DDL `server_default` so existing rows get backfilled cleanly — adding the new NOT NULL column to a non-empty table just works.
+3. **Python ORM default.** The default is also handed to SQLAlchemy as the `Column(default=...)` for callers who construct `Run(...)` directly (rare).
+
+Identifying fields without a `default` must be passed explicitly on every call.
+
+### Identifying floats and normalisation
+
+Identifying float values are rounded to **12 significant figures** by default before insertion, lookup, and DSL comparison. This means `lr = 0.1 + 0.2` and `lr = 0.3` dedupe as the same run — IEEE-754 mantissa noise from arithmetic, JSON/YAML round-trips, or numpy ops collapses to the same canonical float, which is almost always what you want for a sweep dispatcher.
+
+Set the precision via `[project] float_precision = N` in `wallow.toml` (any positive int; 12 is conservative, 6–8 is fine for most ML sweeps). Annotating floats are *not* normalised — they preserve full precision so range queries and metrics analysis behave intuitively.
+
+If you really want bit-exact identifying floats, set `float_precision` to a large number (≥17 covers full double precision) — but consider whether the resulting double-counting is the dedup behaviour you want. For totally-deterministic sweep keys, prefer `string` identifying fields with a fixed format like `"1e-3"`.
+
+NaN values in identifying floats remain rejected (`SchemaValidationError`); infinities pass through normalisation unchanged.
 
 ## Python API
 
 ```python
 from wallow import (
-    Store, load_schema, register, find,    # store / mutation / lookup
-    F,                                      # DSL field reference
-    DuplicateRunError,                      # raised when on_duplicate="raise"
-    PendingMigrationError,                  # DB schema is behind wallow.toml head
-    SchemaValidationError,                  # bad value or unknown field
+    Store, load_schema, register, find, heartbeat,  # store / mutation / lookup / liveness
+    RegisterResult,                                  # return type of register()
+    F,                                               # DSL field reference
+    DuplicateRunError,                               # raised when on_duplicate="raise"
+    PendingMigrationError,                           # DB schema is behind wallow.toml head
+    SchemaValidationError,                           # bad value or unknown field
 )
 ```
 
@@ -186,12 +205,14 @@ The query DSL methods on `Store` are aliases for `Query(store).<method>`:
 ### `register`
 
 ```python
-run = register(
+result = register(
     store,
-    identifying={...},                      # full identifying tuple — every field required
+    identifying={...},                      # identifying tuple; fields with TOML default may be omitted
     annotating={...},                       # subset of annotating fields — optional
-    on_duplicate="raise" | "return_existing" | "overwrite" | "skip",
+    on_duplicate="raise" | "return_existing" | "overwrite" | "skip" | "claim_if_stale",
+    stale_after=timedelta(...),             # required only when on_duplicate="claim_if_stale"
 )
+run = result.run                             # SQLAlchemy ORM object (or None on skip-duplicate)
 ```
 
 `on_duplicate` has **no default** — every caller picks the dedup policy explicitly. This is intentional: the right policy depends on whether you're claiming a slot, finalising a run, or upserting metadata, and the wrong choice silently corrupts data.
@@ -202,35 +223,61 @@ run = register(
 | `"return_existing"`  | the existing run             | none                             | Dedup gate. Read it back, inspect `status`, decide whether to do work. |
 | `"overwrite"`        | the existing run             | each provided annotating field is overwritten | Recording final metrics; upserting metadata. |
 | `"skip"`             | `None`                       | none                             | Bulk seeding when you don't care about the existing row. |
+| `"claim_if_stale"`   | existing if recently heartbeat'd; otherwise overwritten | bumps `updated_at` and writes annotating fields when stale | Live multi-worker dispatch — see [Concurrency](#concurrency). |
+
+`register()` returns a `RegisterResult`:
+
+```python
+@dataclass(frozen=True)
+class RegisterResult:
+    run: Run | None        # the row (None only for "skip" on duplicate)
+    was_inserted: bool     # True iff this call inserted a new row
+    was_updated: bool      # True iff this call wrote annotating fields to an existing row
+    was_skipped: bool      # True iff an existing row was returned without modification
+```
+
+Exactly one flag is True for every outcome except `return_existing` on a duplicate, where all three are False (the row was neither inserted, written to, nor functionally skipped — the caller asked to read it back). Use the flags to log "claimed" vs "rejoined", to count fresh inserts in a sweep loop, or to branch on whether `claim_if_stale` actually claimed.
 
 Validation runs before the DB hit:
 
-- All identifying fields must be provided exactly (missing or extra → `SchemaValidationError`).
-- Unknown annotating fields → `SchemaValidationError`.
+- Identifying fields with a declared TOML `default` may be omitted; missing fields without a default still raise `SchemaValidationError`.
+- Unknown identifying or annotating fields → `SchemaValidationError`.
 - Type mismatch (e.g. passing `1` for a `bool` field, or a naive `datetime`) → `SchemaValidationError`.
+- Identifying float values are normalised to `schema.float_precision` significant figures (default 12) — see [Identifying floats and normalisation](#identifying-floats-and-normalisation).
 
 The returned `Run` is a SQLAlchemy ORM object; access fields as attributes (`run.val_loss`, `run.artefacts_dir`). It's detached from the session, so attribute access after `register()` returns is safe.
 
 ### `find`
 
 ```python
-run = find(store, lr=1e-3, seed=0)          # → Run | None
+run = find(store, lr=1e-3)                   # `seed` may be omitted: it has default = 0
 ```
 
-Direct identifying-tuple lookup. Like `register` with `on_duplicate="skip"` minus the insert. Every identifying field must be supplied.
+Direct identifying-tuple lookup. Like `register` with `on_duplicate="skip"` minus the insert. Identifying fields with a declared `default` may be omitted; floats are normalised the same way as `register` so `find(store, lr=0.1+0.2)` matches a row registered at `lr=0.3`.
+
+### `heartbeat`
+
+```python
+heartbeat(store, identifying={...})          # bumps updated_at; raises if no match
+```
+
+Updates the row's `updated_at` to "now" without touching any other field. Pairs with `on_duplicate="claim_if_stale"` for live multi-worker dispatch — see [Concurrency](#concurrency). Identifying defaults are filled and floats normalised the same way as `register`/`find`.
 
 ### The resume-safe pattern
 
-This is the canonical wallow idiom. Memorise it.
+This is the canonical wallow idiom for **sequential** redispatch (a single dispatcher rerun after a crash). For *concurrent* dispatch from multiple live workers see [Concurrency](#concurrency); the pattern below would let two live workers double-train the same combo.
 
 ```python
 # 1. Claim the slot or read back the existing row.
-run = register(
+result = register(
     store,
     identifying=combo,
     annotating={"status": "running", "started_at": now()},
     on_duplicate="return_existing",
 )
+run = result.run
+# result.was_inserted distinguishes "I just claimed this combo" from
+# "I rejoined someone else's row" if you want to log it.
 
 # 2. If it's already done, skip.
 if run.status == "completed":
@@ -271,6 +318,28 @@ top = q.all()
 ```
 
 Field names resolve at compile time against the schema. Unknown names raise `SchemaValidationError` with a list of valid names.
+
+### Eager validation: `F(name, schema=...)` and `schema.f.<name>`
+
+By default, `F("typo_name")` doesn't raise until the query is materialised — useful for cross-schema reuse, but means typos surface late. Two ways to validate eagerly:
+
+```python
+schema = load_schema("wallow.toml")
+
+# 1. Bind a schema explicitly:
+F("val_loss", schema=schema)         # raises SchemaValidationError on typo
+F("typo_name", schema=schema)        # → SchemaValidationError immediately
+
+# 2. Attribute access on schema.f (autocompletes in IDEs):
+schema.f.val_loss                    # → Field
+schema.f.typo_name                   # → AttributeError immediately
+dir(schema.f)                        # lists every declared field name
+
+# Use either form anywhere F() works:
+top = store.where(schema.f.status == "completed").all()
+```
+
+`F(name)` (no schema arg) keeps the deferred-resolution semantics for code that constructs expressions before knowing which schema they'll run against.
 
 ### Operators
 
@@ -401,7 +470,7 @@ for combo in build_grid():        # list of dicts, full identifying tuple each
         store, identifying=combo,
         annotating={"status": "running", "started_at": now()},
         on_duplicate="return_existing",
-    )
+    ).run
     if run.status == "completed":
         continue
 
@@ -498,7 +567,57 @@ SQLite + WAL handles a few concurrent writer processes fine. Wallow installs the
 - `PRAGMA synchronous=NORMAL`
 - `PRAGMA foreign_keys=ON`
 
-Multiple workers running the same dispatcher script will each call `register(..., return_existing)` and let the UNIQUE constraint resolve the race at the DB layer. The losing call gets an `IntegrityError` internally, retries the read, and returns the existing row.
+The INSERT-race case (two workers race to register the same combo) is handled at the DB layer: the loser catches `IntegrityError` internally, retries the read, and returns the existing row according to its `on_duplicate` policy.
+
+**Bootstrap note.** WAL is set on the *first* connection a Store opens. If you fork N workers against a fresh DB before any Store has opened it, the workers race to upgrade the journal and may deadlock. Open one Store in the parent before forking.
+
+### Live multi-worker dispatch
+
+The [resume-safe pattern](#the-resume-safe-pattern) handles crash-then-restart but does **not** prevent two *live* workers from double-training the same combo: both call `register(..., return_existing)`, both see `status="running"`, both proceed to train. The second `overwrite` clobbers the first.
+
+For live multi-worker dispatch use `on_duplicate="claim_if_stale"` plus `wallow.heartbeat()`:
+
+```python
+import datetime as dt
+from wallow import register, heartbeat
+
+STALE_AFTER = dt.timedelta(minutes=10)   # 2-3× your worst-case silent interval
+
+result = register(
+    store,
+    identifying=combo,
+    annotating={"status": "running", "started_at": now()},
+    on_duplicate="claim_if_stale",
+    stale_after=STALE_AFTER,
+)
+if result.was_skipped:
+    continue                              # another worker is alive on this combo
+if result.run.status == "completed":
+    continue                              # already done
+
+# We hold the slot. Heartbeat periodically while training so other workers
+# see the row as fresh (otherwise our long silence looks stale to them).
+def train_with_heartbeat(combo):
+    last_beat = time.monotonic()
+    for step in train_steps(combo):
+        if time.monotonic() - last_beat > 60:
+            heartbeat(store, identifying=combo)
+            last_beat = time.monotonic()
+    ...
+
+train_with_heartbeat(combo)
+register(store, identifying=combo,
+         annotating={"status": "completed", ...},
+         on_duplicate="overwrite")
+```
+
+`claim_if_stale` reads the row's `updated_at` (which `register` and `heartbeat` both bump) and decides:
+
+- **No row exists.** Insert it; `result.was_inserted=True`.
+- **Row exists, `now - updated_at > stale_after`.** The previous worker has gone silent; overwrite the annotating fields, bump `updated_at`, return with `was_updated=True` (you have claimed it).
+- **Row exists, `updated_at` is recent.** Someone else is alive on it; return the existing row unchanged with `was_skipped=True`.
+
+Pick `stale_after` to be 2–3× your worst-case silent interval (longest gap between heartbeats / writes a healthy worker will produce). Too short → live workers get stolen from; too long → crashed work blocks recovery.
 
 For >10 writers or a shared filesystem with patchy locking, switch the `sqlalchemy.url` in `alembic.ini` to a Postgres URL. The schema/DSL/migration layers are backend-agnostic; only the SQLite-specific pragmas are gated.
 
