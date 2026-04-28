@@ -2,7 +2,7 @@
 
 The schema lives in `wallow.toml`. This module parses it, validates the
 declarations against the type catalogue and reserved-name list, and
-synthesizes a SQLAlchemy declarative `Base` + `Run` class that downstream
+synthesises a SQLAlchemy declarative `Base` + `Run` class that downstream
 code uses with both the DSL and raw SQLAlchemy.
 """
 
@@ -375,7 +375,7 @@ class Schema:
                 json.dumps(value)
             except (TypeError, ValueError) as e:
                 raise SchemaValidationError(
-                    f"field {decl.name!r}: value is not JSON-serializable: {e}",
+                    f"field {decl.name!r}: value is not JSON-serialisable: {e}",
                     field=decl.name,
                     expected_type="json",
                     actual_type=type(value).__name__,

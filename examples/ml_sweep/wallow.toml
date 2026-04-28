@@ -1,0 +1,90 @@
+[project]
+name = "ml_sweep"
+description = "Hyperparameter sweep over a small image-classifier grid; wallow gates which combos still need to be run."
+
+# --- identifying fields -----------------------------------------------------
+# Together these define one experiment. Two runs with identical values here
+# are considered the same experiment and dedup against each other.
+# Identifying fields must be int/float/string/bool.
+
+[identifying.architecture]
+type = "string"
+doc = "Model family, e.g. 'resnet18' | 'resnet50' | 'vit_small'."
+
+[identifying.optimiser]
+type = "string"
+doc = "'sgd' | 'adam' | 'adamw'."
+
+[identifying.learning_rate]
+type = "float"
+doc = "Initial LR. Floats use IEEE 754 identity — 1e-3 and 0.001 dedup the same; 0.1+0.2 and 0.3 do not."
+
+[identifying.batch_size]
+type = "int"
+
+[identifying.weight_decay]
+type = "float"
+default = 0.0
+
+[identifying.num_epochs]
+type = "int"
+default = 10
+doc = "Total training epochs. Treated as part of the experiment identity — a 10-epoch run is a different experiment from a 20-epoch run, not a continuation."
+
+[identifying.seed]
+type = "int"
+default = 0
+
+# --- annotating fields ------------------------------------------------------
+# Everything that's *recorded about* a run rather than *defining* it. These can
+# be edited freely (via on_duplicate="overwrite") without breaking dedup.
+
+[annotating.status]
+type = "string"
+indexed = true
+doc = "'pending' | 'running' | 'completed' | 'failed'."
+
+[annotating.artefacts_dir]
+type = "path"
+doc = "Filesystem directory holding checkpoints, logs, and metrics for this run. Path is deterministic in the identifying fields so a rerun reuses the same directory."
+
+[annotating.best_checkpoint]
+type = "path"
+doc = "Relative path inside artefacts_dir to the best checkpoint (e.g. 'ckpt_epoch_07.pt')."
+
+[annotating.val_loss]
+type = "float"
+indexed = true
+
+[annotating.val_accuracy]
+type = "float"
+indexed = true
+
+[annotating.train_loss]
+type = "float"
+
+[annotating.wall_clock_sec]
+type = "float"
+
+[annotating.training_curve]
+type = "json"
+doc = "Per-epoch metrics, e.g. [{epoch:0, train_loss:..., val_loss:..., val_acc:...}, ...]."
+
+[annotating.host]
+type = "string"
+indexed = true
+
+[annotating.git_commit]
+type = "string"
+indexed = true
+
+[annotating.started_at]
+type = "datetime"
+indexed = true
+
+[annotating.completed_at]
+type = "datetime"
+
+[annotating.error_message]
+type = "string"
+doc = "Populated when status='failed'. Lets you query and re-dispatch failed runs."

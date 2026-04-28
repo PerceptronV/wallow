@@ -24,11 +24,11 @@ CLI smoke-test in a scratch dir: `wallow init --db runs.db && wallow migrate gen
 
 The five source modules form a layered pipeline. Read them in this order:
 
-1. **`schema.py`** — parses `wallow.toml` into a `Schema`, then dynamically synthesizes a fresh `DeclarativeBase` + `Run` SQLAlchemy class per Schema. Each Schema gets its own Base so multiple schemas don't collide on `__tablename__ = "runs"`. The `Run` class carries a `__wallow_schema__` back-reference that the DSL uses to resolve field names at compile time. Identifying fields with a `default` get a DDL-level `server_default` so Alembic can backfill existing rows when the field is added later.
+1. **`schema.py`** — parses `wallow.toml` into a `Schema`, then dynamically synthesises a fresh `DeclarativeBase` + `Run` SQLAlchemy class per Schema. Each Schema gets its own Base so multiple schemas don't collide on `__tablename__ = "runs"`. The `Run` class carries a `__wallow_schema__` back-reference that the DSL uses to resolve field names at compile time. Identifying fields with a `default` get a DDL-level `server_default` so Alembic can backfill existing rows when the field is added later.
 
 2. **`store.py`** — `Store` owns the engine/session and exposes `register()` / `find()` / DSL entry points. Two operating modes determined at init: if `alembic_version` table exists the Store defers DDL to migrations and `check_schema()` compares current revision to head; otherwise it falls back to `Base.metadata.create_all` and skips the check. SQLite pragmas (`WAL`, `synchronous=NORMAL`, `foreign_keys=ON`) are installed via a `connect` event listener.
 
-3. **`dsl.py`** — `F("name") == 4` builds a frozen AST (`_Compare`, `_And`, etc.) which compiles to SQLAlchemy `ColumnElement` only when the `Query` materializes. Field name resolution is deferred to compile time so the same expression can be reused across schemas. `Field` overrides `__eq__`/`__ne__` to return `Expr`, so `__hash__ = None` is set to prevent accidental dict/set use.
+3. **`dsl.py`** — `F("name") == 4` builds a frozen AST (`_Compare`, `_And`, etc.) which compiles to SQLAlchemy `ColumnElement` only when the `Query` materialises. Field name resolution is deferred to compile time so the same expression can be reused across schemas. `Field` overrides `__eq__`/`__ne__` to return `Expr`, so `__hash__ = None` is set to prevent accidental dict/set use.
 
 4. **`migrations.py`** — thin wrappers around `alembic.command` plus two wallow-specific pieces:
    - **Snapshot mechanism**: every `migrate generate` copies the current `wallow.toml` to `alembic/snapshots/{rev}.toml` (with a header marking it auto-generated; `#`-prefixed lines are TOML comments).
@@ -43,7 +43,7 @@ The five source modules form a layered pipeline. Read them in this order:
 - **Identifying fields are restricted to `int`/`float`/`string`/`bool`** (the `_IDENTIFYING_ALLOWED` set). All other types (`json`, `datetime`, `path`) are annotating-only.
 - **Strict bool/int distinction.** Python's `bool` is a subclass of `int`, but the schema treats them as distinct — uses `type(x) is int` rather than `isinstance(x, int)`. Mirror this when adding type checks in `schema.py` and `dsl.py`.
 - **NaN identifying floats are rejected** (NaN ≠ NaN breaks dedup). Naive datetimes are rejected too (ambiguous across machines).
-- **Float identity is by IEEE 754, not normalized.** A run with `x=0.1+0.2` and one with `x=0.3` dedupe as distinct. Spec §9 says don't try to fix this — document it for users instead.
+- **Float identity is by IEEE 754, not normalised.** A run with `x=0.1+0.2` and one with `x=0.3` dedupe as distinct. Spec §9 says don't try to fix this — document it for users instead.
 - **Reserved field names**: `id`, `created_at`, `updated_at`, plus anything matching `^_wallow_` (case-insensitive).
 - **Schema isolation.** Each `Schema` instance creates its own `DeclarativeBase` subclass — never share metadata across Schemas. Two `load_schema()` calls produce two `Run` classes that aren't `is`-equal (spec §13.1); downstream callers should hold a single `Schema` reference.
 - **Alembic uses `render_as_batch=True`** in the env.py template because SQLite can't ALTER TABLE to drop/modify constraints; Alembic emulates via copy-and-rename.
@@ -52,7 +52,7 @@ The five source modules form a layered pipeline. Read them in this order:
 
 ## Templates
 
-`src/wallow/templates/` ships files that `wallow init` materializes via `importlib.resources` (so editable installs, wheels, and zipped wheels all work). When changing template content, also update the `pyproject.toml` `[tool.setuptools.package-data]` glob if you add new file types.
+`src/wallow/templates/` ships files that `wallow init` materialises via `importlib.resources` (so editable installs, wheels, and zipped wheels all work). When changing template content, also update the `pyproject.toml` `[tool.setuptools.package-data]` glob if you add new file types.
 
 ## Testing gotchas
 

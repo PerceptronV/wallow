@@ -129,7 +129,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
     mako_path.write_text(_read_template("alembic", "script.py.mako"))
 
     rel = target_dir
-    print(f"initialized wallow project in {rel}/")
+    print(f"initialised wallow project in {rel}/")
     print(f"  schema: {schema_path.relative_to(rel)}")
     print(f"  config: {ini_path.relative_to(rel)}")
     print(f"  alembic dir: {alembic_dir.relative_to(rel)}/")
@@ -324,7 +324,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     # init
-    p_init = sub.add_parser("init", help="initialize a new wallow project")
+    p_init = sub.add_parser("init", help="initialise a new wallow project")
     p_init.add_argument("--force", action="store_true",
                         help="overwrite existing files")
     p_init.add_argument("--db", default="runs.db",

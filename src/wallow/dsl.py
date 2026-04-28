@@ -2,7 +2,7 @@
 
 `F("name")` produces a `Field`. Comparison operators on `Field` and the
 boolean operators (`&`, `|`, `~`) on `Expr` build an internal AST that's
-compiled to SQLAlchemy when a `Query` is materialized.
+compiled to SQLAlchemy when a `Query` is materialised.
 
 Field name resolution is deferred until compile time, where the
 `Run.__wallow_schema__` back-reference provides the type catalogue.
@@ -399,18 +399,18 @@ class Query:
         return self._replace(where_exprs=self._state.where_exprs + tuple(exprs))
 
     def order_by(self, *clauses: OrderClause | Field) -> "Query":
-        normalized: list[OrderClause] = []
+        normalised: list[OrderClause] = []
         for c in clauses:
             if isinstance(c, Field):
-                normalized.append(c.asc())
+                normalised.append(c.asc())
             elif isinstance(c, OrderClause):
-                normalized.append(c)
+                normalised.append(c)
             else:
                 raise TypeError(
                     f"order_by accepts Field or OrderClause, got {type(c).__name__}"
                 )
         return self._replace(
-            order_clauses=self._state.order_clauses + tuple(normalized)
+            order_clauses=self._state.order_clauses + tuple(normalised)
         )
 
     def limit(self, n: int) -> "Query":
@@ -434,7 +434,7 @@ class Query:
             stmt = stmt.offset(self._state.offset)
         return stmt
 
-    # materialization -----------------------------------------------
+    # materialisation -----------------------------------------------
 
     def all(self) -> list[Any]:
         with self._store.session() as s:

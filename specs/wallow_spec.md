@@ -2,7 +2,7 @@
 
 *A deduplicating run registry for ML research, with TOML schemas, an expression DSL, and Alembic migrations.*
 
-This document is the complete specification for an implementer (human or coding agent). It supersedes prior drafts. The implementer should be able to build the project from this alone; ambiguities should be resolved in favor of the simpler interpretation, and resolved decisions noted in code comments where they affect future maintenance.
+This document is the complete specification for an implementer (human or coding agent). It supersedes prior drafts. The implementer should be able to build the project from this alone; ambiguities should be resolved in favour of the simpler interpretation, and resolved decisions noted in code comments where they affect future maintenance.
 
 ---
 
@@ -35,7 +35,7 @@ This document is the complete specification for an implementer (human or coding 
 
 - Multi-writer / distributed coordination beyond what SQLite WAL provides.
 - Streaming or time-series metrics (use a JSON-typed annotating field if needed).
-- Artifact storage (paths only; users manage their own files).
+- Artefact storage (paths only; users manage their own files).
 - Web UI.
 - Postgres backend in v1 (the abstraction supports it; just not tested).
 - Custom user-defined types.
@@ -148,7 +148,7 @@ indexed = true
 type = "float"
 indexed = true
 
-[annotating.artifacts_dir]
+[annotating.artefacts_dir]
 type = "path"
 
 [annotating.structural_traj]
@@ -178,7 +178,7 @@ Each `[identifying.<name>]` or `[annotating.<name>]` table accepts:
 | `float` | `Float` | `float` | yes |
 | `string` | `String` | `str` | yes |
 | `bool` | `Boolean` | `bool` | yes |
-| `json` | `JSON` | any JSON-serializable | **no** |
+| `json` | `JSON` | any JSON-serialisable | **no** |
 | `path` | `String` | `str` (filesystem path) | **no** |
 | `datetime` | `DateTime` | `datetime.datetime` | **no** |
 
@@ -617,7 +617,7 @@ When `register()` is called, the implementer must validate values:
 
 - For each identifying field, check that the supplied value is `isinstance` of the declared Python type. Raise `SchemaValidationError` on mismatch. Special case: `int` is acceptable for `float` fields; `bool` is *not* acceptable for `int` fields (Python's `bool <: int` would otherwise let `True` slip through).
 - For annotating fields, the same rules apply but with `None` always permitted.
-- For `json` fields, check that the value is JSON-serializable (`json.dumps` succeeds); reject `set`, `bytes`, `datetime` etc. unless coerced upstream.
+- For `json` fields, check that the value is JSON-serialisable (`json.dumps` succeeds); reject `set`, `bytes`, `datetime` etc. unless coerced upstream.
 - For `datetime` fields, accept only `datetime.datetime`. Reject naive datetimes optionally — recommend rejecting them and requiring tz-aware values for cross-machine consistency.
 - For `path` fields, accept any string; do not check existence (paths may refer to files on other machines).
 
@@ -906,7 +906,7 @@ CREATE TABLE runs (
     wall_clock_sec  REAL,
     val_loss        REAL,
     val_accuracy    REAL,
-    artifacts_dir   VARCHAR,
+    artefacts_dir   VARCHAR,
     structural_traj JSON,
     discovered_T    JSON,
 
@@ -975,7 +975,7 @@ Every migration runs in a single transaction (Alembic's default). Migration file
 
 The implementer must handle these explicitly. Tests for each are required.
 
-**Float identity.** Two runs with identifying field `x=0.1+0.2` and `x=0.3` hash differently (and dedupe differently) due to IEEE 754. Document this; don't try to normalize.
+**Float identity.** Two runs with identifying field `x=0.1+0.2` and `x=0.3` hash differently (and dedupe differently) due to IEEE 754. Document this; don't try to normalise.
 
 **NaN in identifying floats.** Reject at register time with `SchemaValidationError`.
 
@@ -1027,7 +1027,7 @@ The test suite must cover:
 - JSON path on non-json fields raises.
 - Field name resolution: known names work, unknown names raise with helpful message.
 - `Query.all()`, `.first()`, `.one()`, `.count()`, `.exists()`.
-- Iteration is streaming (doesn't materialize all rows).
+- Iteration is streaming (doesn't materialise all rows).
 - `order_by`, `limit`, `offset`.
 
 ### `test_migrations.py`
@@ -1071,7 +1071,7 @@ Total estimate: 3-4 weeks for a careful implementation with thorough tests. A co
 
 ## 12. Out of scope for v1
 
-Documented here so the implementer doesn't drift toward them:
+Documented here so the implementer doesn't drift towards them:
 
 - Postgres backend. The abstraction supports it (Alembic + SQLAlchemy are backend-agnostic), but v1 tests SQLite only.
 - Multi-writer / distributed dispatcher coordination beyond SQLite WAL.

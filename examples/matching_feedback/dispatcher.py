@@ -2,7 +2,7 @@
 
 Walks a small grid of (cell_k, cell_sigma, generation, candidate_id, seed)
 tuples, registers each via `wallow.register(..., on_duplicate="return_existing")`,
-then "trains" the candidate (here: synthesizes a deterministic val_loss /
+then "trains" the candidate (here: synthesises a deterministic val_loss /
 val_accuracy from the inputs) and overwrites the run with the result.
 
 The `return_existing` policy is what makes this resume-safe: rerunning the

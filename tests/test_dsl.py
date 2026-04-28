@@ -264,7 +264,7 @@ def test_iter_yields_runs(memory_store: Store):
 
 
 def test_iter_uses_yield_per(memory_store: Store, monkeypatch):
-    """Confirm streaming path calls yield_per (doesn't materialize via .all())."""
+    """Confirm streaming path calls yield_per (doesn't materialise via .all())."""
     _seed(memory_store)
 
     called = {"yield_per": False}

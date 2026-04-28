@@ -216,7 +216,7 @@ def test_register_aware_datetime_accepted(memory_store: Store):
 
 
 def test_register_unjsonable_rejected(memory_store: Store):
-    with pytest.raises(SchemaValidationError, match="not JSON-serializable"):
+    with pytest.raises(SchemaValidationError, match="not JSON-serialisable"):
         register(
             memory_store,
             identifying=make_identifying(),

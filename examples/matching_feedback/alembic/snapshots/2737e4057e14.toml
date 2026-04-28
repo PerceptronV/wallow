@@ -32,7 +32,7 @@ doc = "Random seed for the inner training run"
 [identifying.warmup_steps]
 type = "int"
 default = 0
-doc = "Number of warmup optimizer steps before the inner training loop"
+doc = "Number of warmup optimiser steps before the inner training loop"
 
 # --- annotating fields (queryable, do not affect dedup) --------------------
 
@@ -64,7 +64,7 @@ indexed = true
 type = "float"
 indexed = true
 
-[annotating.artifacts_dir]
+[annotating.artefacts_dir]
 type = "path"
 
 [annotating.structural_traj]

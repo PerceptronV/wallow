@@ -22,7 +22,7 @@ from wallow.cli import main as cli_main
 
 
 # ---------------------------------------------------------------------------
-# Bootstrap fixture: a freshly-initialized wallow project under tmp_path.
+# Bootstrap fixture: a freshly-initialised wallow project under tmp_path.
 # Calling cli.main(['init', ...]) instead of replicating the file copies so
 # the tests exercise the same code path users will hit.
 # ---------------------------------------------------------------------------

@@ -59,7 +59,7 @@ indexed = true
 type = "float"
 indexed = true
 
-[annotating.artifacts_dir]
+[annotating.artefacts_dir]
 type = "path"
 
 [annotating.structural_traj]

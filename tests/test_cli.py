@@ -13,7 +13,7 @@ from wallow.cli import main as cli_main
 
 @pytest.fixture
 def project_dir(tmp_path: Path) -> Path:
-    """Initialized wallow project with the example schema applied."""
+    """Initialised wallow project with the example schema applied."""
     cli_main(["init", "--dir", str(tmp_path), "--db", "runs.db"])
     (tmp_path / "wallow.toml").write_text(
         (Path(__file__).parent / "fixtures" / "example_wallow.toml").read_text()
