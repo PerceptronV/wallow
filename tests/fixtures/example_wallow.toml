@@ -1,0 +1,58 @@
+[project]
+name = "matching_feedback"
+description = "Meta-learning feedback plasticity rules across structural classes."
+
+[identifying.cell_k]
+type = "int"
+doc = "Feature dimension of low-rank component"
+
+[identifying.cell_sigma]
+type = "float"
+doc = "Residual standard deviation"
+
+[identifying.generation]
+type = "int"
+
+[identifying.candidate_id]
+type = "int"
+
+[identifying.seed]
+type = "int"
+default = 0
+
+[annotating.git_commit]
+type = "string"
+indexed = true
+
+[annotating.host]
+type = "string"
+indexed = true
+
+[annotating.status]
+type = "string"
+indexed = true
+doc = "'running' | 'completed' | 'failed'"
+
+[annotating.started_at]
+type = "datetime"
+indexed = true
+
+[annotating.wall_clock_sec]
+type = "float"
+
+[annotating.val_loss]
+type = "float"
+indexed = true
+
+[annotating.val_accuracy]
+type = "float"
+indexed = true
+
+[annotating.artifacts_dir]
+type = "path"
+
+[annotating.structural_traj]
+type = "json"
+
+[annotating.discovered_T]
+type = "json"

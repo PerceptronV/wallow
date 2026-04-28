@@ -1,0 +1,76 @@
+# wallow migration snapshot — DO NOT EDIT
+# revision = 2737e4057e14
+# generated = 2026-04-28T04:37:45.464121+00:00
+
+[project]
+name = "matching_feedback"
+description = "Meta-learning feedback plasticity rules across structural classes."
+
+# --- identifying fields (composite UNIQUE, define dedup) --------------------
+
+[identifying.cell_k]
+type = "int"
+doc = "Feature dimension of low-rank component"
+
+[identifying.cell_sigma]
+type = "float"
+doc = "Residual standard deviation"
+
+[identifying.generation]
+type = "int"
+doc = "Outer-loop generation index in the meta-learning search"
+
+[identifying.candidate_id]
+type = "int"
+doc = "Index of this candidate within its generation"
+
+[identifying.seed]
+type = "int"
+default = 0
+doc = "Random seed for the inner training run"
+
+[identifying.warmup_steps]
+type = "int"
+default = 0
+doc = "Number of warmup optimizer steps before the inner training loop"
+
+# --- annotating fields (queryable, do not affect dedup) --------------------
+
+[annotating.git_commit]
+type = "string"
+indexed = true
+
+[annotating.host]
+type = "string"
+indexed = true
+
+[annotating.status]
+type = "string"
+indexed = true
+doc = "'running' | 'completed' | 'failed'"
+
+[annotating.started_at]
+type = "datetime"
+indexed = true
+
+[annotating.wall_clock_sec]
+type = "float"
+
+[annotating.val_loss]
+type = "float"
+indexed = true
+
+[annotating.val_accuracy]
+type = "float"
+indexed = true
+
+[annotating.artifacts_dir]
+type = "path"
+
+[annotating.structural_traj]
+type = "json"
+doc = "Per-step structural-class probabilities, e.g. [{step: 0, probs: {...}}, ...]"
+
+[annotating.discovered_T]
+type = "json"
+doc = "Discovered transfer matrix entries keyed by 'T_{a}{b}' strings"
