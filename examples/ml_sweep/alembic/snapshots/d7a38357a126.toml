@@ -1,10 +1,16 @@
 # wallow migration snapshot — DO NOT EDIT
-# revision = fd626c71ffe9
-# generated = 2026-04-28T05:10:23.360305+00:00
+# revision = d7a38357a126
+# generated = 2026-04-30T03:53:25.544267+00:00
 
 [project]
 name = "ml_sweep"
 description = "Hyperparameter sweep over a small image-classifier grid; wallow gates which combos still need to be run."
+
+# Where artefact files live. With this set, `Store.artefacts_dir(run)` returns
+# `<artefacts_root>/<substituted layout>`; on each run, the lifecycle helper
+# creates the directory and the dispatcher writes checkpoints into it.
+artefacts_root = "artefacts"
+artefacts_layout = "{architecture}/{uuid}"
 
 # --- identifying fields -----------------------------------------------------
 # Together these define one experiment. Two runs with identical values here
@@ -48,9 +54,8 @@ type = "string"
 indexed = true
 doc = "'pending' | 'running' | 'completed' | 'failed'."
 
-[annotating.artefacts_dir]
-type = "path"
-doc = "Filesystem directory holding checkpoints, logs, and metrics for this run. Path is deterministic in the identifying fields so a rerun reuses the same directory."
+# `artefacts_dir` is no longer stored as an annotation — derive it on the fly
+# from `Store.artefacts_dir(run)`, which uses [project].artefacts_layout.
 
 [annotating.best_checkpoint]
 type = "path"
@@ -67,7 +72,10 @@ indexed = true
 [annotating.train_loss]
 type = "float"
 
-[annotating.wall_clock_sec]
+# wall_clock_sec / started_at / completed_at / error_excerpt are written by
+# `wallow.contrib.lifecycle.run_lifecycle` — declare them so it can populate.
+
+[annotating.wallclock_seconds]
 type = "float"
 
 [annotating.training_curve]
@@ -89,6 +97,6 @@ indexed = true
 [annotating.completed_at]
 type = "datetime"
 
-[annotating.error_message]
+[annotating.error_excerpt]
 type = "string"
-doc = "Populated when status='failed'. Lets you query and re-dispatch failed runs."
+doc = "Populated when status='failed' by run_lifecycle."

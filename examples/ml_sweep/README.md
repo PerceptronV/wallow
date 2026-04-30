@@ -10,17 +10,19 @@ crash and finished combos are skipped.
 - **Identifying = dedup key, annotating = everything else.** The seven
   identifying fields (`architecture`, `optimiser`, `learning_rate`, `batch_size`,
   `weight_decay`, `num_epochs`, `seed`) form a composite UNIQUE constraint. The
-  artefacts directory, metrics, status, training curve, host, git commit — all
-  annotating.
-- **Artefacts paths as annotating data.** `artefacts_dir` is declared as
-  `type = "path"` (a typed string with semantic meaning) and points to a
-  directory derived from a hash of the identifying fields. Same combo → same
-  directory, on every host.
-- **The two-call resume-safe pattern.**
-  `register(..., on_duplicate="return_existing")` before training is the dedup
-  gate; `register(..., on_duplicate="overwrite")` after training records the
-  final state. A crash between them leaves a `running` row that the next
-  dispatch picks up and re-runs.
+  metrics, status, training curve, host, git commit — all annotating.
+- **Artefact directories from the built-in `uuid` column.** Every Run gets an
+  auto-generated 12-char `uuid` (reserved column, set on insert, never
+  mutated). `Store.artefacts_dir(run)` substitutes the
+  `[project].artefacts_layout` template (here `"{architecture}/{uuid}"`)
+  against the row's attributes to derive a stable directory — same combo →
+  same uuid → same directory across reclaims, so retries overwrite partial
+  artefacts in place.
+- **The crash-safe lifecycle helper.**
+  `wallow.contrib.lifecycle.run_lifecycle` wraps the
+  claim → run → finalise/fail dance into a context manager. The body just
+  trains and calls `handle.finalise(annotating={...})`; on exception the
+  helper writes `status='failed'` with a truncated traceback and re-raises.
 - **Alembic-managed schema.** The initial migration is checked in. Adding a
   new hyperparameter dimension later is one `wallow migrate generate` away,
   and existing rows backfill via the field's `default` (see
@@ -68,30 +70,23 @@ wallow migrate history      # revisions, current marked with *
 wallow status               # current rev, head rev, run count
 ```
 
-## The pattern in 12 lines
+## The pattern in 8 lines
 
 ```python
-run = register(
-    store,
-    identifying=combo,
-    annotating={"status": "running", "started_at": now()},
-    on_duplicate="return_existing",
-)
-if run.status == "completed":
-    continue                 # already done — skip the expensive work
+from wallow.contrib.lifecycle import AlreadyCompleted, run_lifecycle
 
-result = train(combo, artefacts_dir_for(combo))   # write artefacts to disk
-
-register(
-    store,
-    identifying=combo,
-    annotating={"status": "completed", "artefacts_dir": ..., "val_loss": ..., ...},
-    on_duplicate="overwrite",
-)
+try:
+    with run_lifecycle(store, identifying=combo) as h:
+        artefacts_dir = store.artefacts_dir(h.run, mkdir=True)
+        result = train(combo, artefacts_dir)
+        h.finalise(annotating={"val_loss": result.loss, ...})
+except AlreadyCompleted:
+    continue   # this combo was already finished by a prior run
 ```
 
-The `register → train → register` triple is the only wallow-specific code in
-the loop; everything else is your training code unchanged.
+The lifecycle helper handles the dedup gate, the crash-safe `failed` status,
+and the wallclock measurement automatically. Everything inside the `with`
+block is your training code unchanged.
 
 ## Evolving the schema
 

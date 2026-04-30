@@ -13,6 +13,7 @@ import json
 import math
 import re
 import sys
+import uuid as _uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping
@@ -54,7 +55,9 @@ _TYPE_CATALOGUE: dict[str, tuple[type, Any]] = {
 
 _IDENTIFYING_ALLOWED: frozenset[str] = frozenset({"int", "float", "string", "bool"})
 
-_RESERVED_NAMES: frozenset[str] = frozenset({"id", "created_at", "updated_at"})
+_RESERVED_NAMES: frozenset[str] = frozenset(
+    {"id", "created_at", "updated_at", "uuid"}
+)
 _RESERVED_PREFIX = re.compile(r"^_wallow_", re.IGNORECASE)
 
 _VALID_FIELD_KEYS: frozenset[str] = frozenset(
@@ -62,8 +65,25 @@ _VALID_FIELD_KEYS: frozenset[str] = frozenset(
 )
 
 _VALID_PROJECT_KEYS: frozenset[str] = frozenset(
-    {"name", "description", "float_precision"}
+    {
+        "name",
+        "description",
+        "float_precision",
+        "artefacts_root",
+        "artefacts_layout",
+    }
 )
+
+# Default layout when a project sets `artefacts_root` without `artefacts_layout`.
+# Just the uuid — no nesting by default.
+_DEFAULT_ARTEFACTS_LAYOUT = "{uuid}"
+
+# Placeholders inside an artefacts layout: `{name}` where `name` is a field on
+# the Run. Single open-curly that isn't a placeholder is a parse error.
+_LAYOUT_PLACEHOLDER = re.compile(r"\{([^{}]+)\}")
+# These names are valid in a layout even though they're not user-declared
+# fields: `uuid` is wallow-reserved and always present on every Run.
+_LAYOUT_BUILTIN_NAMES: frozenset[str] = frozenset({"uuid"})
 
 # Default precision for normalising identifying float values. 12 sig figs is
 # comfortably below double-precision's ~15.95 sig fig ceiling, so values that
@@ -131,6 +151,18 @@ def _parse(data: Mapping[str, Any]) -> "Schema":
         raise SchemaParseError(
             f"[project].float_precision must be a positive int, got {float_precision!r}"
         )
+    artefacts_root = project.get("artefacts_root")
+    if artefacts_root is not None and (
+        not isinstance(artefacts_root, str) or not artefacts_root
+    ):
+        raise SchemaParseError(
+            "[project].artefacts_root must be a non-empty string if present"
+        )
+    artefacts_layout = project.get("artefacts_layout", _DEFAULT_ARTEFACTS_LAYOUT)
+    if not isinstance(artefacts_layout, str) or not artefacts_layout:
+        raise SchemaParseError(
+            "[project].artefacts_layout must be a non-empty string if present"
+        )
 
     raw_id = data.get("identifying", {})
     raw_an = data.get("annotating", {})
@@ -156,14 +188,18 @@ def _parse(data: Mapping[str, Any]) -> "Schema":
 
     identifying = frozenset(raw_id.keys())
     annotating = frozenset(raw_an.keys())
-    return Schema(
+    schema = Schema(
         project_name=name,
         description=description,
         fields=fields,
         identifying=identifying,
         annotating=annotating,
         float_precision=int(float_precision),
+        artefacts_root=artefacts_root,
+        artefacts_layout=artefacts_layout,
     )
+    schema.validate_layout()
+    return schema
 
 
 def _parse_field_decl(
@@ -280,6 +316,8 @@ class Schema:
     identifying: frozenset[str]
     annotating: frozenset[str]
     float_precision: int
+    artefacts_root: str | None
+    artefacts_layout: str
     Base: type
     Run: type
 
@@ -292,6 +330,8 @@ class Schema:
         identifying: frozenset[str],
         annotating: frozenset[str],
         float_precision: int = _DEFAULT_FLOAT_PRECISION,
+        artefacts_root: str | None = None,
+        artefacts_layout: str = _DEFAULT_ARTEFACTS_LAYOUT,
     ) -> None:
         self.project_name = project_name
         self.description = description
@@ -299,6 +339,8 @@ class Schema:
         self.identifying = identifying
         self.annotating = annotating
         self.float_precision = float_precision
+        self.artefacts_root = artefacts_root
+        self.artefacts_layout = artefacts_layout
         self.Base, self.Run = _build_model(self)
 
     # iteration / lookup --------------------------------------------------
@@ -383,6 +425,24 @@ class Schema:
                 f"unknown annotating fields: {sorted(extra)}; "
                 f"valid: {sorted(self.annotating)}",
                 extra_keys=frozenset(extra),
+            )
+
+    def validate_layout(self) -> None:
+        """Confirm every `{name}` placeholder in artefacts_layout is resolvable.
+
+        A name is resolvable when it is either ``uuid`` (the wallow-reserved
+        column injected on every Run) or a declared field on this schema.
+        Called automatically at the end of TOML parsing; safe to invoke again
+        if the layout is mutated post-construction.
+        """
+        names = _LAYOUT_PLACEHOLDER.findall(self.artefacts_layout)
+        valid = self.identifying | self.annotating | _LAYOUT_BUILTIN_NAMES
+        unknown = sorted(set(names) - valid)
+        if unknown:
+            raise SchemaValidationError(
+                f"artefacts_layout {self.artefacts_layout!r} references "
+                f"unknown field(s) {unknown}; valid: {sorted(valid)}",
+                extra_keys=frozenset(unknown),
             )
 
     def validate_value(self, decl: FieldDecl, value: Any, *, allow_none: bool) -> None:
@@ -516,6 +576,16 @@ def _build_model(schema: Schema) -> tuple[type, type]:
         "created_at": Column(DateTime, nullable=False, default=_utcnow),
         "updated_at": Column(
             DateTime, nullable=False, default=_utcnow, onupdate=_utcnow
+        ),
+        # Stable opaque per-row id, generated on INSERT and never mutated.
+        # Used as the directory name for any artefacts a worker writes; see
+        # `Store.artefacts_dir`.
+        "uuid": Column(
+            String(12),
+            nullable=False,
+            unique=True,
+            index=True,
+            default=lambda: _uuid.uuid4().hex[:12],
         ),
     }
 

@@ -1,8 +1,8 @@
 """initial schema
 
-Revision ID: fd626c71ffe9
+Revision ID: d7a38357a126
 Revises: 
-Create Date: 2026-04-28 01:10:23.354319
+Create Date: 2026-04-29 23:53:25.538813
 
 NOTE: wallow migrations are immutable once applied to any environment.
 If you need to change something in this file BEFORE applying it, edit
@@ -15,7 +15,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision: str = 'fd626c71ffe9'
+revision: str = 'd7a38357a126'
 down_revision: Union[str, Sequence[str], None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -27,6 +27,7 @@ def upgrade() -> None:
     sa.Column('id', sa.Integer(), autoincrement=True, nullable=False),
     sa.Column('created_at', sa.DateTime(), nullable=False),
     sa.Column('updated_at', sa.DateTime(), nullable=False),
+    sa.Column('uuid', sa.String(length=12), nullable=False),
     sa.Column('architecture', sa.String(), nullable=False),
     sa.Column('optimiser', sa.String(), nullable=False),
     sa.Column('learning_rate', sa.Float(), nullable=False),
@@ -35,18 +36,17 @@ def upgrade() -> None:
     sa.Column('num_epochs', sa.Integer(), server_default='10', nullable=False),
     sa.Column('seed', sa.Integer(), server_default='0', nullable=False),
     sa.Column('status', sa.String(), nullable=True),
-    sa.Column('artefacts_dir', sa.String(), nullable=True),
     sa.Column('best_checkpoint', sa.String(), nullable=True),
     sa.Column('val_loss', sa.Float(), nullable=True),
     sa.Column('val_accuracy', sa.Float(), nullable=True),
     sa.Column('train_loss', sa.Float(), nullable=True),
-    sa.Column('wall_clock_sec', sa.Float(), nullable=True),
+    sa.Column('wallclock_seconds', sa.Float(), nullable=True),
     sa.Column('training_curve', sa.JSON(), nullable=True),
     sa.Column('host', sa.String(), nullable=True),
     sa.Column('git_commit', sa.String(), nullable=True),
     sa.Column('started_at', sa.DateTime(), nullable=True),
     sa.Column('completed_at', sa.DateTime(), nullable=True),
-    sa.Column('error_message', sa.String(), nullable=True),
+    sa.Column('error_excerpt', sa.String(), nullable=True),
     sa.PrimaryKeyConstraint('id'),
     sa.UniqueConstraint('architecture', 'batch_size', 'learning_rate', 'num_epochs', 'optimiser', 'seed', 'weight_decay', name='uq_runs_identifying')
     )
@@ -61,6 +61,7 @@ def upgrade() -> None:
         batch_op.create_index(batch_op.f('ix_runs_seed'), ['seed'], unique=False)
         batch_op.create_index(batch_op.f('ix_runs_started_at'), ['started_at'], unique=False)
         batch_op.create_index(batch_op.f('ix_runs_status'), ['status'], unique=False)
+        batch_op.create_index(batch_op.f('ix_runs_uuid'), ['uuid'], unique=True)
         batch_op.create_index(batch_op.f('ix_runs_val_accuracy'), ['val_accuracy'], unique=False)
         batch_op.create_index(batch_op.f('ix_runs_val_loss'), ['val_loss'], unique=False)
         batch_op.create_index(batch_op.f('ix_runs_weight_decay'), ['weight_decay'], unique=False)
@@ -74,6 +75,7 @@ def downgrade() -> None:
         batch_op.drop_index(batch_op.f('ix_runs_weight_decay'))
         batch_op.drop_index(batch_op.f('ix_runs_val_loss'))
         batch_op.drop_index(batch_op.f('ix_runs_val_accuracy'))
+        batch_op.drop_index(batch_op.f('ix_runs_uuid'))
         batch_op.drop_index(batch_op.f('ix_runs_status'))
         batch_op.drop_index(batch_op.f('ix_runs_started_at'))
         batch_op.drop_index(batch_op.f('ix_runs_seed'))

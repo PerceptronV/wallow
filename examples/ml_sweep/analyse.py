@@ -45,7 +45,8 @@ def main() -> None:
             f"{best.architecture}/{best.optimiser} lr={best.learning_rate} bs={best.batch_size}"
             f"  acc={best.val_accuracy:.4f} loss={best.val_loss:.4f}"
         )
-        print(f"  artefacts: {best.artefacts_dir}/{best.best_checkpoint}")
+        # artefacts_dir is no longer an annotation — derive it on the fly.
+        print(f"  artefacts: {store.artefacts_dir(best)}/{best.best_checkpoint}")
 
     # Per-architecture top run. Useful when comparing model families.
     print("\ntop val_accuracy per architecture:")
@@ -66,7 +67,7 @@ def main() -> None:
     if failures:
         print(f"\nfailures ({len(failures)}):")
         for r in failures[:5]:
-            print(f"  id={r.id} {r.architecture}/{r.optimiser} lr={r.learning_rate}: {r.error_message}")
+            print(f"  id={r.id} {r.architecture}/{r.optimiser} lr={r.learning_rate}: {r.error_excerpt}")
 
     # Combos worth picking out for downstream use — adamw runs at lr<=1e-3
     # whose best checkpoint is a late epoch (we read into the JSON curve).

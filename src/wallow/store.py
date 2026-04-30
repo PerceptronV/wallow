@@ -243,6 +243,60 @@ class Store:
         cfg = migrations._make_config(ini, db_url=str(self._engine.url))
         migrations.apply(cfg)
 
+    # ---- artefacts directory + uuid lookup -----------------------------
+
+    def artefacts_dir(
+        self,
+        run: Any,
+        *parts: str | Path,
+        mkdir: bool = False,
+    ) -> Path:
+        """Return ``Path(artefacts_root) / <substituted layout> / *parts``.
+
+        The layout (``[project].artefacts_layout`` in wallow.toml, default
+        ``"{uuid}"``) is substituted using *run*'s attribute values; each
+        substituted component is sanitised for filesystem safety.
+
+        Set ``mkdir=True`` to create the directory (and parents) before
+        returning. Raises :class:`WallowError` if the schema does not
+        configure ``[project].artefacts_root``.
+        """
+        from ._paths import substitute_layout
+
+        root = self._schema.artefacts_root
+        if root is None:
+            raise WallowError(
+                "Store.artefacts_dir() requires [project].artefacts_root in "
+                "wallow.toml"
+            )
+        layout = self._schema.artefacts_layout
+        # Pull every name the layout references off the run row. Unknown
+        # names would have been rejected at schema-load by validate_layout,
+        # but we re-validate here so misuse via a custom Schema instance
+        # raises a clear error rather than AttributeError.
+        attrs: dict[str, Any] = {}
+        from .schema import _LAYOUT_PLACEHOLDER  # local import: avoids cycle
+        for name in _LAYOUT_PLACEHOLDER.findall(layout):
+            if not hasattr(run, name):
+                raise WallowError(
+                    f"artefacts_layout references {{{name}}} but the run row "
+                    f"has no such attribute"
+                )
+            attrs[name] = getattr(run, name)
+        rel = substitute_layout(layout, attrs)
+        full = Path(root) / rel
+        for part in parts:
+            full = full / part
+        if mkdir:
+            full.mkdir(parents=True, exist_ok=True)
+        return full
+
+    def find_by_uuid(self, uuid: str) -> Any | None:
+        """Look up a Run by its auto-generated ``uuid`` column."""
+        Run = self._schema.Run
+        with self.session() as s:
+            return s.scalar(select(Run).filter_by(uuid=uuid))
+
 
 # --- module-level register / find / heartbeat ------------------------------
 

@@ -64,7 +64,7 @@ def main() -> None:
             "seed": seed,
             "warmup_steps": 0,
         }
-        run = register(
+        result = register(
             store,
             identifying=identifying,
             annotating={
@@ -75,7 +75,9 @@ def main() -> None:
             },
             on_duplicate="return_existing",
         )
-        if run.status != "running":
+        # `return_existing` writes the new annotations only on first insert;
+        # on collision the existing row's status is whatever it was before.
+        if not result.was_inserted and result.run.status == "completed":
             skipped_runs += 1
             continue
 

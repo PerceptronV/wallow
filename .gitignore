@@ -61,6 +61,7 @@ examples/**/runs.db
 examples/**/runs.db-journal
 examples/**/runs.db-wal
 examples/**/runs.db-shm
+examples/ml_sweep/artefacts/
 examples/ml_sweep/artifacts/
 
 # Django stuff:

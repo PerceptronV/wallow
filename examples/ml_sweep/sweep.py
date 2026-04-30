@@ -3,73 +3,54 @@
 Pattern
 -------
 Every unique combination of identifying hyperparameters maps to one experiment.
-Before doing any work for a combo, we `register(..., on_duplicate="return_existing")`
-and check the returned run's `status`:
+The :func:`wallow.contrib.lifecycle.run_lifecycle` helper handles the
+crash-safe claim → train → finalise/fail flow for us; we only write the
+training body.
 
-    - if `status == "completed"`: skip — already done.
-    - otherwise: train, write artefacts to a deterministic directory, and
-      `register(..., on_duplicate="overwrite")` to record the final metrics
-      and the artefacts_dir path.
+For each combo:
 
-This makes the dispatcher idempotent: rerunning after any kind of crash —
-preempted job, OOM, network blip, even a full process kill — picks up exactly
-where it left off without redoing finished work.
+    - if the row exists with ``status='completed'``: ``run_lifecycle`` raises
+      :class:`AlreadyCompleted` and we skip.
+    - otherwise: train, and ``handle.finalise(annotating={...})`` records the
+      final metrics. If the body raises, the lifecycle marks the row failed
+      (with a truncated error excerpt) and re-raises.
 
-The artefacts_dir is derived from the identifying fields (a short hash), so a
-rerun of the same combo writes to the same directory and overwrites any partial
-artefacts from a failed prior attempt.
+Artefacts go into the directory returned by ``store.artefacts_dir(run)``,
+which is derived from ``[project].artefacts_layout`` in wallow.toml. The
+layout substitutes ``{architecture}`` and ``{uuid}`` (the latter is
+auto-generated and stable across reclaims, so retries overwrite the failed
+attempt's files in place).
 
 Run order:
     wallow migrate apply       # create runs.db at the head revision
     python sweep.py            # train all 96 combos
     python sweep.py            # reruns are no-ops on completed combos
-
-The schema is alembic-managed: the initial migration is checked in under
-`alembic/versions/`. To evolve (add a hyperparameter, etc.), edit wallow.toml
-then `wallow migrate generate "<message>"` and review/apply the diff.
 """
 
 from __future__ import annotations
 
-import datetime as dt
-import hashlib
 import json
 import math
 import random
 import socket
-import time
 from itertools import product
 from pathlib import Path
 
-from wallow import F, Store, load_schema, register
+from wallow import F, Store, load_schema
+from wallow.contrib.lifecycle import AlreadyCompleted, run_lifecycle
 
 HERE = Path(__file__).parent
 SCHEMA_PATH = HERE / "wallow.toml"
 DB_PATH = HERE / "runs.db"
-ARTEFACTS_ROOT = HERE / "artefacts"
-
-
-def artefacts_dir_for(identifying: dict) -> Path:
-    """Deterministic per-run directory.
-
-    A short content hash of the identifying fields keeps directory names
-    stable across reruns (so we can overwrite partial artefacts) and short
-    enough to fit on a typical filesystem.
-    """
-    payload = json.dumps(identifying, sort_keys=True).encode()
-    digest = hashlib.sha1(payload).hexdigest()[:10]
-    return ARTEFACTS_ROOT / identifying["architecture"] / digest
 
 
 def fake_train(identifying: dict, artefacts_dir: Path) -> dict:
     """Stand-in for a real training loop.
 
-    Writes a few files into `artefacts_dir`, then returns a dict of metrics
-    and final paths. Replace this with your actual training code; the wallow
+    Writes a few files into *artefacts_dir*, then returns a dict of metrics
+    and final paths. Replace with your actual training code; the wallow
     integration around it is unchanged.
     """
-    artefacts_dir.mkdir(parents=True, exist_ok=True)
-
     rng = random.Random(json.dumps(identifying, sort_keys=True))
     n_epochs = identifying["num_epochs"]
     base = 1.0 / math.sqrt(identifying["batch_size"]) + identifying["learning_rate"]
@@ -147,67 +128,35 @@ def main() -> None:
 
     skipped = trained = failed = 0
     host = socket.gethostname()
-    git_commit = "deadbeef"  # `subprocess.check_output(["git", "rev-parse", "HEAD"]).strip().decode()` in real code
+    git_commit = "deadbeef"  # subprocess.check_output(["git", "rev-parse", "HEAD"]) in real code
 
     for identifying in combos:
-        # 1. Dedup gate: claim the slot or read back the existing row.
-        run = register(
-            store,
-            identifying=identifying,
-            annotating={
-                "status": "running",
-                "host": host,
-                "git_commit": git_commit,
-                "started_at": dt.datetime.now(dt.timezone.utc),
-            },
-            on_duplicate="return_existing",
-        )
-
-        if run.status == "completed":
-            skipped += 1
-            continue
-
-        # 2. Do the expensive work. Artefacts go to a deterministic directory
-        #    so a rerun of this combo overwrites any partial state from before.
-        artefacts_dir = artefacts_dir_for(identifying)
-        t0 = time.perf_counter()
         try:
-            result = fake_train(identifying, artefacts_dir)
-        except Exception as e:
-            register(
+            with run_lifecycle(
                 store,
                 identifying=identifying,
-                annotating={
-                    "status": "failed",
-                    "error_message": f"{type(e).__name__}: {e}",
-                    "wall_clock_sec": time.perf_counter() - t0,
-                    "completed_at": dt.datetime.now(dt.timezone.utc),
-                },
-                on_duplicate="overwrite",
-            )
+                start_annotating={"host": host, "git_commit": git_commit},
+            ) as h:
+                # The lifecycle has marked the row 'running'; uuid + dir are
+                # stable across reclaim attempts.
+                artefacts_dir = store.artefacts_dir(h.run, mkdir=True)
+                result = fake_train(identifying, artefacts_dir)
+                h.finalise(
+                    annotating={
+                        "best_checkpoint": result["best_checkpoint"],
+                        "train_loss": result["train_loss"],
+                        "val_loss": result["val_loss"],
+                        "val_accuracy": result["val_accuracy"],
+                        "training_curve": result["training_curve"],
+                    }
+                )
+                trained += 1
+        except AlreadyCompleted:
+            skipped += 1
+        except Exception:
+            # Lifecycle has already written status='failed' with the excerpt;
+            # we just count the failure and keep going.
             failed += 1
-            continue
-
-        # 3. Record success: metrics + artefacts path. `overwrite` so the row
-        #    lands in a known state regardless of whether this combo had a
-        #    prior `running`/`failed` attempt.
-        register(
-            store,
-            identifying=identifying,
-            annotating={
-                "status": "completed",
-                "artefacts_dir": str(artefacts_dir),
-                "best_checkpoint": result["best_checkpoint"],
-                "train_loss": result["train_loss"],
-                "val_loss": result["val_loss"],
-                "val_accuracy": result["val_accuracy"],
-                "training_curve": result["training_curve"],
-                "wall_clock_sec": time.perf_counter() - t0,
-                "completed_at": dt.datetime.now(dt.timezone.utc),
-            },
-            on_duplicate="overwrite",
-        )
-        trained += 1
 
     print(f"done: {trained} trained, {skipped} already complete, {failed} failed")
 

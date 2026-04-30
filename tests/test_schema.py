@@ -82,7 +82,9 @@ def test_annotating_defaults(schema_from_string):
     assert f.nullable is True
 
 
-@pytest.mark.parametrize("name", ["id", "created_at", "updated_at", "_wallow_foo"])
+@pytest.mark.parametrize(
+    "name", ["id", "created_at", "updated_at", "uuid", "_wallow_foo"]
+)
 def test_reserved_name_rejected(schema_from_string, name):
     with pytest.raises(SchemaParseError, match="reserved"):
         schema_from_string(
@@ -381,3 +383,109 @@ def test_server_default_for_bool_identifying(schema_from_string):
     )
     flag_col = s.Run.__table__.columns["flag"]
     assert flag_col.server_default.arg == "1"
+
+
+# ---- uuid column + artefacts layout ---------------------------------------
+
+
+def test_uuid_column_present_on_run(schema_from_string):
+    s = schema_from_string(
+        """
+        [project]
+        name = "p"
+        [identifying.k]
+        type = "int"
+        """
+    )
+    cols = s.Run.__table__.columns
+    assert "uuid" in cols
+    uuid_col = cols["uuid"]
+    assert uuid_col.nullable is False
+    assert uuid_col.unique is True
+    assert uuid_col.index is True
+
+
+def test_uuid_default_generates_12_char_hex(schema_from_string):
+    s = schema_from_string(
+        """
+        [project]
+        name = "p"
+        [identifying.k]
+        type = "int"
+        """
+    )
+    default_callable = s.Run.__table__.columns["uuid"].default.arg
+    sample = default_callable(None)  # SQLAlchemy passes a context arg
+    assert isinstance(sample, str)
+    assert len(sample) == 12
+    int(sample, 16)  # raises if non-hex
+
+
+def test_artefacts_root_default_is_none(schema_from_string):
+    s = schema_from_string(
+        """
+        [project]
+        name = "p"
+        [identifying.k]
+        type = "int"
+        """
+    )
+    assert s.artefacts_root is None
+    assert s.artefacts_layout == "{uuid}"
+
+
+def test_artefacts_root_and_layout_parsed(schema_from_string):
+    s = schema_from_string(
+        """
+        [project]
+        name = "p"
+        artefacts_root = "data"
+        artefacts_layout = "{k}/{uuid}"
+        [identifying.k]
+        type = "int"
+        """
+    )
+    assert s.artefacts_root == "data"
+    assert s.artefacts_layout == "{k}/{uuid}"
+
+
+def test_artefacts_layout_unknown_field_rejected(schema_from_string):
+    with pytest.raises(SchemaValidationError, match="unknown"):
+        schema_from_string(
+            """
+            [project]
+            name = "p"
+            artefacts_root = "data"
+            artefacts_layout = "{nonexistent}/{uuid}"
+            [identifying.k]
+            type = "int"
+            """
+        )
+
+
+def test_artefacts_layout_uuid_always_resolvable(schema_from_string):
+    # uuid isn't a user-declared field but is always present on every Run.
+    s = schema_from_string(
+        """
+        [project]
+        name = "p"
+        artefacts_root = "data"
+        artefacts_layout = "runs/{uuid}"
+        [identifying.k]
+        type = "int"
+        """
+    )
+    assert s.artefacts_layout == "runs/{uuid}"
+
+
+def test_artefacts_root_must_be_string(schema_from_string):
+    with pytest.raises(SchemaParseError, match="non-empty string"):
+        schema_from_string(
+            """
+            [project]
+            name = "p"
+            artefacts_root = ""
+            [identifying.k]
+            type = "int"
+            """
+        )

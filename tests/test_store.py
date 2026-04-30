@@ -314,3 +314,163 @@ def test_concurrent_register_one_winner(tmp_path: Path):
             [(str(db_path), str(schema_path)), (str(db_path), str(schema_path))],
         )
     assert sorted(results) == ["duplicate", "inserted"]
+
+
+# ---- uuid column ------------------------------------------------------------
+
+
+def test_register_inserts_uuid(memory_store: Store):
+    run = register(
+        memory_store, identifying=make_identifying(), on_duplicate="raise"
+    ).run
+    assert run.uuid is not None
+    assert isinstance(run.uuid, str)
+    assert len(run.uuid) == 12
+    int(run.uuid, 16)  # valid hex
+
+
+def test_uuid_stable_across_overwrite(memory_store: Store):
+    first = register(
+        memory_store,
+        identifying=make_identifying(),
+        annotating={"status": "running"},
+        on_duplicate="raise",
+    ).run
+    original_uuid = first.uuid
+    result = register(
+        memory_store,
+        identifying=make_identifying(),
+        annotating={"status": "completed", "val_accuracy": 0.9},
+        on_duplicate="overwrite",
+    )
+    assert result.was_updated
+    assert result.run.uuid == original_uuid
+    assert result.run.status == "completed"
+
+
+def test_uuid_unique_across_inserts(memory_store: Store):
+    uuids = set()
+    for i in range(10):
+        run = register(
+            memory_store,
+            identifying=make_identifying(candidate_id=i),
+            on_duplicate="raise",
+        ).run
+        uuids.add(run.uuid)
+    assert len(uuids) == 10
+
+
+def test_uuid_cannot_be_passed_as_annotation(memory_store: Store):
+    # `uuid` is reserved (not in schema.annotating); register should reject it.
+    with pytest.raises(SchemaValidationError, match="unknown annotating"):
+        register(
+            memory_store,
+            identifying=make_identifying(),
+            annotating={"uuid": "deadbeefcafe"},
+            on_duplicate="raise",
+        )
+
+
+def test_find_by_uuid(memory_store: Store):
+    run = register(
+        memory_store, identifying=make_identifying(), on_duplicate="raise"
+    ).run
+    hit = memory_store.find_by_uuid(run.uuid)
+    assert hit is not None
+    assert hit.id == run.id
+
+
+def test_find_by_uuid_returns_none_when_missing(memory_store: Store):
+    assert memory_store.find_by_uuid("nonexistent1") is None
+
+
+# ---- Store.artefacts_dir ----------------------------------------------------
+
+
+def test_artefacts_dir_requires_root(memory_store: Store):
+    """example_schema doesn't set artefacts_root; the helper should refuse."""
+    from wallow import WallowError
+
+    run = register(
+        memory_store, identifying=make_identifying(), on_duplicate="raise"
+    ).run
+    with pytest.raises(WallowError, match="artefacts_root"):
+        memory_store.artefacts_dir(run)
+
+
+def test_artefacts_dir_default_layout_is_uuid(schema_from_string, tmp_path):
+    s = schema_from_string(
+        f"""
+        [project]
+        name = "p"
+        artefacts_root = "{tmp_path}"
+        [identifying.k]
+        type = "int"
+        """
+    )
+    store = Store(":memory:", schema=s, check_schema=False)
+    run = register(store, identifying={"k": 1}, on_duplicate="raise").run
+    assert store.artefacts_dir(run) == tmp_path / run.uuid
+
+
+def test_artefacts_dir_substitutes_layout(schema_from_string, tmp_path):
+    s = schema_from_string(
+        f"""
+        [project]
+        name = "p"
+        artefacts_root = "{tmp_path}"
+        artefacts_layout = "{{architecture}}/{{uuid}}"
+        [identifying.architecture]
+        type = "string"
+        """
+    )
+    store = Store(":memory:", schema=s, check_schema=False)
+    run = register(
+        store, identifying={"architecture": "resnet18"}, on_duplicate="raise"
+    ).run
+    expected = tmp_path / "resnet18" / run.uuid
+    assert store.artefacts_dir(run) == expected
+
+
+def test_artefacts_dir_sanitises_substitutions(schema_from_string, tmp_path):
+    s = schema_from_string(
+        f"""
+        [project]
+        name = "p"
+        artefacts_root = "{tmp_path}"
+        artefacts_layout = "{{label}}/{{uuid}}"
+        [identifying.label]
+        type = "string"
+        """
+    )
+    store = Store(":memory:", schema=s, check_schema=False)
+    # Spaces, accents, slashes should all be normalised away.
+    run = register(
+        store, identifying={"label": "Hello World / café"}, on_duplicate="raise"
+    ).run
+    out = store.artefacts_dir(run)
+    # The label component should be lowercase ASCII with no spaces/slashes.
+    assert "Hello World" not in str(out)
+    assert "café" not in str(out)
+    assert "Hello_World_cafe" in str(out)
+
+
+def test_artefacts_dir_appends_parts_and_mkdir(schema_from_string, tmp_path):
+    s = schema_from_string(
+        f"""
+        [project]
+        name = "p"
+        artefacts_root = "{tmp_path}"
+        [identifying.k]
+        type = "int"
+        """
+    )
+    store = Store(":memory:", schema=s, check_schema=False)
+    run = register(store, identifying={"k": 1}, on_duplicate="raise").run
+    out = store.artefacts_dir(run, "checkpoints", "best.pt", mkdir=False)
+    assert out == tmp_path / run.uuid / "checkpoints" / "best.pt"
+    # mkdir=True creates the parent dir (since the path includes a file part,
+    # this creates `<root>/<uuid>/checkpoints/best.pt` as a directory — that
+    # is the documented behaviour: mkdir always operates on the full path).
+    out2 = store.artefacts_dir(run, "logs", mkdir=True)
+    assert out2.is_dir()

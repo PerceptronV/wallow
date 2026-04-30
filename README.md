@@ -376,13 +376,17 @@ When the DSL doesn't cover a query, use raw SQLAlchemy via `store.engine` or `st
 
 ## Recipe: an ML sweep with artefact paths
 
-This is the pattern the user's question is about: dispatch a hyperparameter sweep where each unique combo gets a deterministic artefacts directory, recorded as an annotating `path` field, with the dispatcher fully resume-safe.
+This is the pattern the user's question is about: dispatch a hyperparameter sweep where each unique combo gets a deterministic artefacts directory, with the dispatcher fully resume-safe.
+
+Two wallow features make this short: every Run has a built-in `uuid` column (auto-generated on insert, never mutated), and `Store.artefacts_dir(run)` derives a stable directory from the schema's `[project].artefacts_layout` template.
 
 `wallow.toml`:
 
 ```toml
 [project]
 name = "ml_sweep"
+artefacts_root = "artefacts"
+artefacts_layout = "{architecture}/{uuid}"   # default would be "{uuid}"
 
 # Identifying = the experiment definition.
 [identifying.architecture]
@@ -409,13 +413,24 @@ default = 10
 type = "int"
 default = 0
 
-# Annotating = recorded about the run.
+# Annotating = recorded about the run. The lifecycle helper writes status,
+# started_at, completed_at, wallclock_seconds, error_excerpt automatically;
+# declare them so it has somewhere to put the values.
 [annotating.status]
 type = "string"
 indexed = true
 
-[annotating.artefacts_dir]
-type = "path"               # filesystem location for this run's outputs
+[annotating.started_at]
+type = "datetime"
+
+[annotating.completed_at]
+type = "datetime"
+
+[annotating.wallclock_seconds]
+type = "float"
+
+[annotating.error_excerpt]
+type = "string"
 
 [annotating.best_checkpoint]
 type = "path"
@@ -430,76 +445,37 @@ indexed = true
 
 [annotating.training_curve]
 type = "json"
-
-[annotating.host]
-type = "string"
-
-[annotating.git_commit]
-type = "string"
-
-[annotating.started_at]
-type = "datetime"
-
-[annotating.completed_at]
-type = "datetime"
-
-[annotating.error_message]
-type = "string"
 ```
 
-Dispatcher:
+Dispatcher (using `wallow.contrib.lifecycle`):
 
 ```python
-import datetime as dt, hashlib, json
-from pathlib import Path
-from wallow import Store, load_schema, register
-
-ARTEFACTS_ROOT = Path("artefacts")
-
-def artefacts_dir_for(combo: dict) -> Path:
-    digest = hashlib.sha1(json.dumps(combo, sort_keys=True).encode()).hexdigest()[:10]
-    return ARTEFACTS_ROOT / combo["architecture"] / digest
-
-def now(): return dt.datetime.now(dt.timezone.utc)
+from wallow import Store, load_schema
+from wallow.contrib.lifecycle import AlreadyCompleted, run_lifecycle
 
 schema = load_schema("wallow.toml")
 store  = Store("runs.db", schema=schema)
 
 for combo in build_grid():        # list of dicts, full identifying tuple each
-    run = register(
-        store, identifying=combo,
-        annotating={"status": "running", "started_at": now()},
-        on_duplicate="return_existing",
-    ).run
-    if run.status == "completed":
-        continue
-
-    artefacts_dir = artefacts_dir_for(combo)
-    artefacts_dir.mkdir(parents=True, exist_ok=True)
-
     try:
-        result = train(combo, artefacts_dir)         # writes ckpts, logs, metrics.json
-    except Exception as e:
-        register(store, identifying=combo,
-                 annotating={"status": "failed", "error_message": f"{type(e).__name__}: {e}",
-                             "completed_at": now()},
-                 on_duplicate="overwrite")
-        continue
-
-    register(
-        store, identifying=combo,
-        annotating={
-            "status": "completed",
-            "artefacts_dir": str(artefacts_dir),
-            "best_checkpoint": result["best_ckpt"],
-            "val_loss": result["val_loss"],
-            "val_accuracy": result["val_acc"],
-            "training_curve": result["curve"],
-            "completed_at": now(),
-        },
-        on_duplicate="overwrite",
-    )
+        with run_lifecycle(store, identifying=combo) as h:
+            artefacts_dir = store.artefacts_dir(h.run, mkdir=True)
+            result = train(combo, artefacts_dir)   # writes ckpts, logs, metrics.json
+            h.finalise(annotating={
+                "best_checkpoint": result["best_ckpt"],
+                "val_loss": result["val_loss"],
+                "val_accuracy": result["val_acc"],
+                "training_curve": result["curve"],
+            })
+    except AlreadyCompleted:
+        continue   # this combo was already finished by a prior run
+    # any other exception: lifecycle has already written status='failed'
+    # with a truncated traceback in `error_excerpt`; bubble or swallow as you like
 ```
+
+The `run_lifecycle` helper wraps the claim → start → finalise/fail dance: on entry it claims the row (`status='running'`); on success it writes `status='completed'`; on exception it writes `status='failed'` with a truncated traceback in `error_excerpt`, then re-raises. The body never has to manage status transitions.
+
+`Store.artefacts_dir(h.run, mkdir=True)` returns `<artefacts_root>/<substituted layout>` — for this schema, `artefacts/<architecture>/<uuid>`. The `uuid` is the same on every retry of a failed combo, so artefacts overwrite in place; the directory is sanitised so even free-form string fields (`"Hello World / café"` → `Hello_World_cafe`) produce safe path components.
 
 Analyse:
 
@@ -514,12 +490,13 @@ best = (
          .order_by(F("val_accuracy").desc(), F("val_loss").asc())
          .first()
 )
-print(best.artefacts_dir, best.best_checkpoint)
+print(store.artefacts_dir(best), "/", best.best_checkpoint)
 
-# Direct lookup by identifying tuple.
+# Direct lookup by identifying tuple, or by the auto-generated uuid.
 specific = find(store, architecture="resnet18", optimiser="adamw",
                 learning_rate=1e-3, batch_size=128, weight_decay=0.0,
                 num_epochs=10, seed=0)
+also = store.find_by_uuid("8fa740691a0a")
 ```
 
 A complete, runnable, Alembic-managed version is in [`examples/ml_sweep/`](examples/ml_sweep/) (with the initial migration checked in). For a longer walkthrough of the multi-migration evolution flow — adding an identifying field to a populated DB — see [`examples/matching_feedback/`](examples/matching_feedback/).
@@ -558,6 +535,30 @@ wallow migrate stamp head            # records the revision without DDL
 ```
 
 After this, edits to `wallow.toml` flow through the normal `generate` + `apply` cycle.
+
+### Upgrading from wallow ≤0.1.0 (adding the `uuid` column)
+
+The auto-generated `uuid` column was added in 0.2.0. If your DB was created on an earlier version it has no `uuid`; run `wallow migrate generate "add uuid"` and the autogenerator will detect the missing column. It will produce a migration like:
+
+```python
+def upgrade() -> None:
+    op.add_column('runs', sa.Column('uuid', sa.String(length=12), nullable=False))
+    op.create_index('ix_runs_uuid', 'runs', ['uuid'], unique=True)
+```
+
+That `nullable=False` will fail to apply against a non-empty table. Edit the migration to add a SQLite-friendly backfill before the `nullable=False` constraint and the unique index:
+
+```python
+def upgrade() -> None:
+    op.add_column('runs', sa.Column('uuid', sa.String(length=12), nullable=True))
+    op.execute("UPDATE runs SET uuid = lower(hex(randomblob(6))) WHERE uuid IS NULL")
+    op.alter_column('runs', 'uuid', nullable=False)
+    op.create_index('ix_runs_uuid', 'runs', ['uuid'], unique=True)
+```
+
+`randomblob(6)` is 6 bytes = 12 hex chars, matching the format used by new inserts. Then `wallow migrate apply` and existing rows now have stable uuids.
+
+For Postgres, use `gen_random_uuid()` (requires the `pgcrypto` extension) and a wider column.
 
 ## Concurrency
 
