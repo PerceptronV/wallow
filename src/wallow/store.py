@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import datetime as _dt
+import os
+import sqlite3
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,6 +63,39 @@ def _build_url(db_path: str | Path) -> str:
     return f"sqlite:///{p}"
 
 
+# Journal mode used when the requested one is unavailable (e.g. WAL on a
+# networked filesystem). DELETE is SQLite's portable rollback journal; it works
+# on NFS/Lustre where WAL's shared-memory index does not.
+_FALLBACK_JOURNAL_MODE = "DELETE"
+_DEFAULT_JOURNAL_MODE = "WAL"
+# Wait this long for a competing writer's lock before raising "database is
+# locked" — matters when many workers share one DB file (e.g. over NFS).
+_DEFAULT_BUSY_TIMEOUT_MS = 5000
+
+
+def _resolve_journal_mode(explicit: str | None) -> str:
+    """Journal mode: explicit arg > ``WALLOW_JOURNAL_MODE`` env > WAL."""
+    if explicit is not None:
+        return explicit.upper()
+    env = os.environ.get("WALLOW_JOURNAL_MODE")
+    if env:
+        return env.upper()
+    return _DEFAULT_JOURNAL_MODE
+
+
+def _resolve_busy_timeout(explicit: int | None) -> int:
+    """Busy timeout in ms: explicit arg > ``WALLOW_BUSY_TIMEOUT_MS`` env > 5000."""
+    if explicit is not None:
+        return int(explicit)
+    env = os.environ.get("WALLOW_BUSY_TIMEOUT_MS")
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    return _DEFAULT_BUSY_TIMEOUT_MS
+
+
 class Store:
     """SQLite-backed store for a wallow schema.
 
@@ -79,13 +115,23 @@ class Store:
         *,
         schema: Schema,
         check_schema: bool = True,
+        journal_mode: str | None = None,
+        busy_timeout_ms: int | None = None,
     ) -> None:
         self._schema = schema
         self._db_path = db_path
+        # Journal mode defaults to WAL (best for concurrent writers on local
+        # disk) but is configurable, because WAL is unsupported on networked
+        # filesystems (NFS/Lustre). Resolution: arg > env > WAL, with an
+        # automatic fallback to a rollback journal if the mode can't be set.
+        self._journal_mode = _resolve_journal_mode(journal_mode)
+        self._busy_timeout_ms = _resolve_busy_timeout(busy_timeout_ms)
+        self._effective_journal_mode: str | None = None
+        self._journal_fallback_warned = False
         url = _build_url(db_path)
         # `check_same_thread=False` lets the multiprocessing concurrent test
         # share a session factory across threads if the OS allows it; SQLite
-        # handles cross-process via WAL.
+        # handles cross-process via the journal mode + busy_timeout below.
         connect_args: dict[str, Any] = {}
         if url.startswith("sqlite:"):
             connect_args["check_same_thread"] = False
@@ -115,13 +161,60 @@ class Store:
         def _on_connect(dbapi_connection, _record):  # type: ignore[no-untyped-def]
             cur = dbapi_connection.cursor()
             try:
-                # WAL is a no-op on :memory: — skip to avoid a noisy warning.
+                # Wait for a competing writer's lock rather than failing fast —
+                # set before anything that might contend. No-op-cheap on
+                # :memory:, so set it unconditionally.
+                cur.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
+                # Journal mode is a no-op on :memory: — skip to avoid a warning.
                 if not is_memory:
-                    cur.execute("PRAGMA journal_mode=WAL")
+                    self._apply_journal_mode(cur)
                     cur.execute("PRAGMA synchronous=NORMAL")
                 cur.execute("PRAGMA foreign_keys=ON")
             finally:
                 cur.close()
+
+    def _apply_journal_mode(self, cur: Any) -> None:
+        """Set the requested journal mode, falling back to a rollback journal
+        when it is unavailable.
+
+        WAL on a networked filesystem (NFS/Lustre) either raises
+        ``OperationalError: locking protocol`` / ``disk I/O error`` or silently
+        keeps the prior mode — its shared-memory index needs a local FS. Either
+        way we drop to ``DELETE`` (portable everywhere) so a shared-DB sweep
+        keeps working instead of crashing on the first connection.
+        """
+        requested = self._journal_mode
+        reason: str | None = None
+        try:
+            cur.execute(f"PRAGMA journal_mode={requested}")
+            row = cur.fetchone()
+            applied = (row[0] if row else "").upper()
+            if requested == "WAL" and applied != "WAL":
+                reason = f"SQLite kept journal_mode={applied or 'unknown'!r}"
+        except sqlite3.OperationalError as exc:
+            reason = str(exc)
+
+        if reason is not None and requested != _FALLBACK_JOURNAL_MODE:
+            cur.execute(f"PRAGMA journal_mode={_FALLBACK_JOURNAL_MODE}")
+            self._effective_journal_mode = _FALLBACK_JOURNAL_MODE
+            self._warn_journal_fallback(requested, reason)
+        else:
+            self._effective_journal_mode = requested
+
+    def _warn_journal_fallback(self, requested: str, reason: str) -> None:
+        if self._journal_fallback_warned:
+            return
+        self._journal_fallback_warned = True
+        warnings.warn(
+            f"wallow: PRAGMA journal_mode={requested} unavailable for "
+            f"{self._db_path!r} ({reason}); falling back to "
+            f"journal_mode={_FALLBACK_JOURNAL_MODE}. This is expected on "
+            f"networked filesystems (NFS/Lustre), where WAL is unsupported. "
+            f"Set WALLOW_JOURNAL_MODE={_FALLBACK_JOURNAL_MODE} to choose it "
+            f"explicitly and silence this warning.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     def _alembic_version_present(self) -> bool:
         return "alembic_version" in inspect(self._engine).get_table_names()
@@ -164,6 +257,13 @@ class Store:
     @property
     def engine(self) -> Engine:
         return self._engine
+
+    @property
+    def journal_mode(self) -> str | None:
+        """The journal mode actually in effect (the requested mode, or the
+        rollback-journal fallback when the requested one was unavailable).
+        ``None`` until the first connection is opened (or for ``:memory:``)."""
+        return self._effective_journal_mode
 
     # ---- session / execute --------------------------------------------
 

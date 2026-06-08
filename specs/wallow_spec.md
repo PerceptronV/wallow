@@ -54,10 +54,14 @@ wallow/
 │       ├── __init__.py            # public API re-exports
 │       ├── schema.py              # TOML parser + dynamic model generation
 │       ├── store.py               # Store class, register, find
+│       ├── _paths.py              # path sanitisation + layout substitution
 │       ├── dsl.py                 # F, Expr, operator overloading, compilation
 │       ├── migrations.py          # Alembic wrapper, snapshot mechanism
 │       ├── cli.py                 # argparse entry points (`wallow` command)
 │       ├── errors.py              # exception hierarchy
+│       ├── contrib/               # optional first-class helpers
+│       │   ├── __init__.py
+│       │   └── lifecycle.py       # run_lifecycle context manager
 │       └── templates/             # files copied by `wallow init`
 │           ├── wallow.toml.template
 │           ├── alembic.ini.template
@@ -67,8 +71,10 @@ wallow/
 └── tests/
     ├── test_schema.py
     ├── test_store.py
+    ├── test_paths.py
     ├── test_dsl.py
     ├── test_migrations.py
+    ├── test_lifecycle.py
     ├── test_cli.py
     └── fixtures/
         └── example_wallow.toml
@@ -187,20 +193,36 @@ Identifying fields must be hashable scalars; the four allowed types reflect this
 
 ### Reserved field names
 
-The implementer must reject any user-declared field with name `id`, `created_at`, `updated_at`, or `_wallow_*`. These are managed by `wallow` and appear automatically on every model.
+The implementer must reject any user-declared field with name `id`, `created_at`, `updated_at`, `uuid`, or any name matching `_wallow_*`. These are managed by `wallow` and appear automatically on every model.
+
+`uuid` is a 12-character hex string generated on `INSERT` and never mutated thereafter (not even by `on_duplicate='overwrite'`). It is the recommended identifier to embed in artefact directory paths — see [§3.1 Artefact paths](#31-artefact-paths).
+
+### 3.1 Artefact paths
+
+The `[project]` table accepts two optional keys controlling the built-in `Store.artefacts_dir(run, *parts, mkdir=False)` helper:
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `artefacts_root` | string | `None` | Root directory for artefact files. When unset, `Store.artefacts_dir` raises `WallowError`. |
+| `artefacts_layout` | string | `"{uuid}"` | Template substituted against the Run's column values; `{name}` placeholders may reference any identifying or annotating field, plus the built-in `uuid`. Validated at schema-load time against declared field names. |
+
+Substituted values are sanitised: NFKD-normalised, dropped to ASCII, illegal filename characters replaced with `_`, leading/trailing dots and underscores stripped. Empty results raise `SchemaValidationError`.
+
+Returned path is `Path(artefacts_root) / <substituted layout> / *parts`. With `mkdir=True`, the directory (including parents) is created before the path is returned.
 
 ### Validation rules
 
 The TOML loader must:
 
 1. Parse the file using `tomllib` (Python 3.11+) or `tomli` (3.10).
-2. Require exactly one `[project]` table with at least `name` (string). Accept optional `description` (string) and `float_precision` (positive int, default 12). Reject any other key inside `[project]`.
+2. Require exactly one `[project]` table with at least `name` (string). Accept optional `description` (string), `float_precision` (positive int, default 12), `artefacts_root` (non-empty string), and `artefacts_layout` (non-empty string, default `"{uuid}"`). Reject any other key inside `[project]`.
 3. Require at least one identifying field. Schemas with zero identifying fields raise `SchemaParseError`.
 4. Validate every field's `type` is in the catalogue.
 5. Reject identifying fields with disallowed types.
 6. Reject duplicate field names across `[identifying]` and `[annotating]`.
-7. Reject reserved names.
+7. Reject reserved names (`id`, `created_at`, `updated_at`, `uuid`, `_wallow_*`).
 8. Validate that `default` values, when present, are coercible to the declared type.
+9. Validate that every `{name}` placeholder in `artefacts_layout` resolves to either `uuid` or a declared field; otherwise raise `SchemaValidationError`.
 
 ---
 
@@ -290,6 +312,24 @@ class Store:
 
     def migrate(self) -> None:
         """Apply all pending migrations. Equivalent to `wallow migrate apply`."""
+
+    def find_by_uuid(self, uuid: str) -> Run | None:
+        """Look up a Run by its auto-generated `uuid` column."""
+
+    def artefacts_dir(
+        self,
+        run: Run,
+        *parts: str | Path,
+        mkdir: bool = False,
+    ) -> Path:
+        """Return `Path(artefacts_root) / <substituted layout> / *parts`.
+
+        Substitutes the schema's `artefacts_layout` template against `run`'s
+        attribute values; each substituted component is sanitised for
+        filesystem safety. With `mkdir=True`, creates the directory (and
+        parents) before returning. Raises `WallowError` when the schema
+        does not declare `[project].artefacts_root`.
+        """
 ```
 
 ### 4.3 register()
@@ -480,6 +520,31 @@ class Query:
 
 **String operators on non-string fields.** Compile-time error.
 
+### 4.5b `wallow.contrib.lifecycle` (optional helper)
+
+For the common "claim → train → finalise/fail" worker pattern, the implementer should ship a context manager under `wallow.contrib.lifecycle`:
+
+```python
+from wallow.contrib.lifecycle import AlreadyCompleted, run_lifecycle
+
+with run_lifecycle(store, identifying=combo, force=False) as h:
+    artefacts_dir = store.artefacts_dir(h.run, mkdir=True)
+    result = train(combo, artefacts_dir)
+    h.finalise(annotating={"val_loss": result.loss, ...})
+```
+
+Lifecycle:
+
+1. **Claim** — `register(..., on_duplicate='return_existing')` writes `status='pending'`. If the row already exists with `status='completed'` and not `force`, raises `AlreadyCompleted(run)`.
+2. **Start** — `register(..., on_duplicate='overwrite')` writes `status='running'`, `started_at=now`, plus optional `start_annotating` fields.
+3. **Body** — yields a `WorkerHandle` with `.run`, `.uuid`, `.finalise(annotating=...)`.
+4. **Success** — `finalise()` writes `status='completed'`, `completed_at`, `wallclock_seconds`, plus the caller's results. If the body returns without finalising, the lifecycle writes a minimal completion record.
+5. **Failure** — any exception triggers `register(..., overwrite)` with `status='failed'`, `error_excerpt` (truncated traceback), `completed_at`, `wallclock_seconds`, then re-raises.
+
+The schema must declare these annotating fields for the helper to write into: `status` (string), `started_at` / `completed_at` (datetime), `wallclock_seconds` (float), `error_excerpt` (string). Missing any of these raises `SchemaValidationError` at the first `register()` call.
+
+Lives under `contrib/` (not the top-level package) so the core stays state-machine-free for users who want a different pattern.
+
 ### 4.6 Errors
 
 ```python
@@ -632,6 +697,11 @@ def _build_model(schema: Schema) -> tuple[type, type]:
         "id": Column(Integer, primary_key=True, autoincrement=True),
         "created_at": Column(DateTime, nullable=False, default=_utcnow),
         "updated_at": Column(DateTime, nullable=False, default=_utcnow, onupdate=_utcnow),
+        # Auto-generated 12-char hex, set on INSERT only; never mutated.
+        "uuid": Column(
+            String(12), nullable=False, unique=True, index=True,
+            default=lambda: uuid.uuid4().hex[:12],
+        ),
     }
 
     for f in schema.fields.values():
@@ -978,7 +1048,7 @@ See §4.6.
 
 ## 7. Storage model
 
-The implementer should produce a `runs` table matching the TOML, with one column per declared field plus `id`, `created_at`, `updated_at`. The `UniqueConstraint` is named `uq_runs_identifying` and includes all identifying fields (sorted alphabetically). Indexes are named `ix_runs_<field>` per SQLAlchemy convention.
+The implementer should produce a `runs` table matching the TOML, with one column per declared field plus `id`, `created_at`, `updated_at`, `uuid`. The `UniqueConstraint` is named `uq_runs_identifying` and includes all identifying fields (sorted alphabetically). Indexes are named `ix_runs_<field>` per SQLAlchemy convention; `uuid` is unique and indexed (`ix_runs_uuid`).
 
 Example DDL produced for the matching-feedback schema:
 
@@ -987,6 +1057,7 @@ CREATE TABLE runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at      DATETIME NOT NULL,
     updated_at      DATETIME NOT NULL,
+    uuid            VARCHAR(12) NOT NULL UNIQUE,
 
     cell_k          INTEGER NOT NULL,
     cell_sigma      REAL    NOT NULL,
@@ -1009,6 +1080,7 @@ CREATE TABLE runs (
 );
 
 CREATE INDEX ix_runs_cell_k          ON runs(cell_k);
+CREATE UNIQUE INDEX ix_runs_uuid     ON runs(uuid);
 -- ... one per identifying + indexed annotating field
 ```
 
@@ -1063,6 +1135,20 @@ Each generated revision file has a corresponding `alembic/snapshots/{revision_id
 ### 8.4 Migration safety
 
 Every migration runs in a single transaction (Alembic's default). Migration files are immutable once applied to any environment — the implementer should document this in the README and include it in the `script.py.mako` template comment.
+
+### 8.5 Adopting the `uuid` column on a pre-existing DB
+
+Databases created before the `uuid` column was reserved (wallow ≤0.1.0) need a one-shot migration. `wallow migrate generate "add uuid"` autogenerates the column add + unique index, but the autogenerated `nullable=False` will fail to apply on a non-empty table. The implementer must document the SQLite-friendly backfill pattern:
+
+```python
+def upgrade() -> None:
+    op.add_column('runs', sa.Column('uuid', sa.String(length=12), nullable=True))
+    op.execute("UPDATE runs SET uuid = lower(hex(randomblob(6))) WHERE uuid IS NULL")
+    op.alter_column('runs', 'uuid', nullable=False)
+    op.create_index('ix_runs_uuid', 'runs', ['uuid'], unique=True)
+```
+
+`randomblob(6)` is 6 bytes = 12 hex chars, matching the format used by new inserts. Postgres users substitute `gen_random_uuid()` (requires the `pgcrypto` extension) and a wider column.
 
 ---
 

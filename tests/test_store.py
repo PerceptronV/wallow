@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as _dt
 import multiprocessing as mp
 import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from sqlalchemy import text
 
 from wallow import (
     DuplicateRunError,
+    Schema,
     SchemaValidationError,
     Store,
     find,
@@ -246,6 +248,61 @@ def test_wal_journal_mode_on_file_db(file_store: Store):
     with file_store.session() as s:
         mode = s.execute(text("PRAGMA journal_mode")).scalar()
     assert mode == "wal"
+    assert file_store.journal_mode == "WAL"
+
+
+def test_journal_mode_param_override(tmp_path: Path, example_schema: Schema):
+    store = Store(tmp_path / "delete.db", schema=example_schema,
+                  check_schema=False, journal_mode="DELETE")
+    with store.session() as s:
+        mode = s.execute(text("PRAGMA journal_mode")).scalar()
+    assert mode == "delete"
+    assert store.journal_mode == "DELETE"
+
+
+def test_journal_mode_env_override(tmp_path: Path, example_schema: Schema,
+                                   monkeypatch):
+    monkeypatch.setenv("WALLOW_JOURNAL_MODE", "truncate")
+    store = Store(tmp_path / "trunc.db", schema=example_schema, check_schema=False)
+    with store.session() as s:
+        mode = s.execute(text("PRAGMA journal_mode")).scalar()
+    assert mode == "truncate"
+
+
+def test_busy_timeout_default_and_override(tmp_path: Path, example_schema: Schema):
+    default_store = Store(tmp_path / "a.db", schema=example_schema, check_schema=False)
+    with default_store.session() as s:
+        assert s.execute(text("PRAGMA busy_timeout")).scalar() == 5000
+
+    custom = Store(tmp_path / "b.db", schema=example_schema, check_schema=False,
+                   busy_timeout_ms=12345)
+    with custom.session() as s:
+        assert s.execute(text("PRAGMA busy_timeout")).scalar() == 12345
+
+
+def test_journal_mode_falls_back_when_wal_unavailable(file_store: Store, recwarn):
+    """Simulate WAL being rejected (as on NFS/Lustre): the store must drop to
+    the DELETE rollback journal and warn once, not crash."""
+    class _FakeCursor:
+        def __init__(self):
+            self.calls: list[str] = []
+
+        def execute(self, sql: str):
+            self.calls.append(sql)
+            if "journal_mode=WAL" in sql:
+                raise sqlite3.OperationalError("locking protocol")
+
+        def fetchone(self):
+            return ("delete",)
+
+    file_store._journal_mode = "WAL"
+    file_store._journal_fallback_warned = False
+    cur = _FakeCursor()
+    file_store._apply_journal_mode(cur)
+
+    assert any("journal_mode=DELETE" in c for c in cur.calls)
+    assert file_store.journal_mode == "DELETE"
+    assert any(w.category is RuntimeWarning for w in recwarn.list)
 
 
 def test_foreign_keys_pragma_on(memory_store: Store):

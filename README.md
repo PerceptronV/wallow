@@ -564,13 +564,35 @@ For Postgres, use `gen_random_uuid()` (requires the `pgcrypto` extension) and a 
 
 SQLite + WAL handles a few concurrent writer processes fine. Wallow installs the right pragmas on every connection:
 
-- `PRAGMA journal_mode=WAL` (skipped on `:memory:`)
+- `PRAGMA journal_mode=WAL` (skipped on `:memory:`; configurable — see below)
 - `PRAGMA synchronous=NORMAL`
+- `PRAGMA busy_timeout=5000` — wait up to 5 s for a competing writer's lock instead of failing fast (configurable)
 - `PRAGMA foreign_keys=ON`
 
 The INSERT-race case (two workers race to register the same combo) is handled at the DB layer: the loser catches `IntegrityError` internally, retries the read, and returns the existing row according to its `on_duplicate` policy.
 
 **Bootstrap note.** WAL is set on the *first* connection a Store opens. If you fork N workers against a fresh DB before any Store has opened it, the workers race to upgrade the journal and may deadlock. Open one Store in the parent before forking.
+
+### Networked filesystems (NFS / Lustre)
+
+WAL's shared-memory index requires a local filesystem; on NFS/Lustre, `PRAGMA journal_mode=WAL` fails with `OperationalError: locking protocol` (or a disk-I/O error). This is exactly the case for an HPC sweep whose `runs.db` lives on shared scratch so that many nodes can dedup against one file.
+
+Wallow handles it two ways:
+
+- **Automatic fallback.** If the requested journal mode can't be set, the Store drops to `DELETE` (SQLite's portable rollback journal, which works on NFS/Lustre) and emits a one-time `RuntimeWarning`. A shared-DB sweep keeps running instead of crashing on the first connection.
+- **Explicit control.** Choose the mode and lock-wait directly, via constructor args or env vars (arg > env > default):
+
+  ```python
+  Store(db_path, schema=schema, journal_mode="DELETE", busy_timeout_ms=30000)
+  ```
+  ```bash
+  export WALLOW_JOURNAL_MODE=DELETE      # skip the doomed WAL attempt + its warning
+  export WALLOW_BUSY_TIMEOUT_MS=30000    # raise lock-wait under heavy multi-writer load
+  ```
+
+  `Store.journal_mode` reports the mode actually in effect after the first connection.
+
+With a rollback journal, writers are serialized by a coarse file lock rather than WAL's reader/writer concurrency, so a high-contention sweep over NFS may see writers waiting (hence the larger `busy_timeout`). Correctness is unaffected — the dedup guarantees are the same.
 
 ### Live multi-worker dispatch
 
